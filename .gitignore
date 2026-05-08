@@ -1,0 +1,15 @@
+.venv/
+models/*.pth
+models/*.onnx
+models/**/*.onnx
+models/**/*.onnx.data
+engines/*.engine
+engines/**/*.engine
+__pycache__/
+*.pyc
+build/
+build_obs/
+output/
+vendor/
+raw_sample/
+.claude/settings.local.json
