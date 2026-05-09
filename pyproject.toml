@@ -4,6 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "matanyone2 @ git+https://github.com/pq-yang/MatAnyone2.git@e3370127319c63a6dc8a49c69de2d41d90137f91",
+    "sam-2 @ git+https://github.com/facebookresearch/sam2.git",
+    "huggingface_hub>=0.26.0",
     "onnx>=1.21.0",
     "onnxruntime-gpu>=1.23.2",
     "onnxscript>=0.7.0",
@@ -22,3 +24,6 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+
+[tool.setuptools]
+py-modules = []

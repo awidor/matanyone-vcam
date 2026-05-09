@@ -31,9 +31,9 @@ private:
     std::unique_ptr<nvinfer1::IRuntime, TrtDestroy> runtime_;
     std::unique_ptr<TrtEngine> encode_;
     std::unique_ptr<TrtEngine> read_;
+    std::unique_ptr<TrtEngine> pixelFusion_;
     std::unique_ptr<TrtEngine> segment_;
     std::unique_ptr<TrtEngine> encodeMask_;
-    std::unique_ptr<TrtEngine> encodeMaskShallow_;
     cudaStream_t stream_{};
     std::unordered_map<std::string, TensorBuffer> buffers_;
     int memSlot_ = 1;

@@ -114,6 +114,9 @@ std::vector<std::string> TrtEngine::tensorNames() const {
 }
 
 void TrtEngine::bind(const std::string& name, void* ptr) {
+    if (!hasTensor(name)) {
+        return;
+    }
     if (!context_->setTensorAddress(name.c_str(), ptr)) {
         throw std::runtime_error("setTensorAddress failed for " + name + " in " + path_);
     }

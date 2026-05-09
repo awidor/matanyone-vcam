@@ -63,6 +63,10 @@ class Pipeline:
         self.segment = TrtEngine(engine_dir / "segment_fp16.engine", self.runtime)
         self.encode_mask = TrtEngine(engine_dir / "encode_mask_fp16.engine", self.runtime)
         shallow_path = engine_dir / "encode_mask_shallow_fp16.engine"
+        if not shallow_path.exists():
+            fallback = engine_dir.parent / "faithful" / "encode_mask_shallow_fp16.engine"
+            if fallback.exists():
+                shallow_path = fallback
         self.encode_mask_shallow = TrtEngine(shallow_path, self.runtime) if shallow_path.exists() else None
         self.full_read = "input_10" in self.read.io
 

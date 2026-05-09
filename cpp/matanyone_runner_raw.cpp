@@ -34,11 +34,18 @@ int main(int argc, char** argv) {
         std::string engineDir = "engines/faithful";
         fs::path sampleDir = "raw_sample";
         fs::path outDir = "output/raw_alpha";
+        int maxFrames = 0;
         if (argc > 1) {
             sampleDir = argv[1];
         }
         if (argc > 2) {
             engineDir = argv[2];
+        }
+        if (argc > 3) {
+            outDir = argv[3];
+        }
+        if (argc > 4) {
+            maxFrames = std::stoi(argv[4]);
         }
         fs::create_directories(outDir);
 
@@ -57,6 +64,9 @@ int main(int argc, char** argv) {
 
         int frameIndex = 1;
         for (;; ++frameIndex) {
+            if (maxFrames > 0 && frameIndex >= maxFrames) {
+                break;
+            }
             fs::path framePath = sampleDir / "frames" / (std::string(5 - std::to_string(frameIndex).length(), '0') +
                                                           std::to_string(frameIndex) + ".rgbf32");
             if (!fs::exists(framePath)) {

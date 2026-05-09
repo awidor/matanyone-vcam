@@ -1,5 +1,6 @@
 #include "matanyone_runner.h"
 
+#include <filesystem>
 #include <iostream>
 
 namespace {
@@ -14,6 +15,25 @@ nvinfer1::Dims dims(std::initializer_list<int64_t> values) {
     return d;
 }
 
+void copyTimeSlotFromContiguous(std::uint8_t* dst, int slot, const void* src, int channels, cudaStream_t stream,
+                                const char* what) {
+    constexpr size_t hwBytes = 45ULL * 80ULL * sizeof(float);
+    constexpr size_t slotPitch = 5ULL * hwBytes;
+    checkCuda(cudaMemcpy2DAsync(dst + static_cast<size_t>(slot) * hwBytes, slotPitch, src, hwBytes, hwBytes,
+                                static_cast<size_t>(channels), cudaMemcpyDeviceToDevice, stream),
+              what);
+}
+
+void copyTimeSlotToSlot(std::uint8_t* base, int dstSlot, int srcSlot, int channels, cudaStream_t stream,
+                        const char* what) {
+    constexpr size_t hwBytes = 45ULL * 80ULL * sizeof(float);
+    constexpr size_t slotPitch = 5ULL * hwBytes;
+    checkCuda(cudaMemcpy2DAsync(base + static_cast<size_t>(dstSlot) * hwBytes, slotPitch,
+                                base + static_cast<size_t>(srcSlot) * hwBytes, slotPitch, hwBytes,
+                                static_cast<size_t>(channels), cudaMemcpyDeviceToDevice, stream),
+              what);
+}
+
 } // namespace
 
 MatAnyoneRunner::MatAnyoneRunner(const std::string& engineDir) {
@@ -24,10 +44,12 @@ MatAnyoneRunner::MatAnyoneRunner(const std::string& engineDir) {
 
     encode_ = std::make_unique<TrtEngine>(*runtime_, engineDir + "/encode_image_fp16.engine");
     read_ = std::make_unique<TrtEngine>(*runtime_, engineDir + "/read_memory_fp16.engine");
+    auto pixelFusionPath = std::filesystem::path(engineDir) / "pixel_fusion_fp16.engine";
+    if (std::filesystem::exists(pixelFusionPath)) {
+        pixelFusion_ = std::make_unique<TrtEngine>(*runtime_, pixelFusionPath.string());
+    }
     segment_ = std::make_unique<TrtEngine>(*runtime_, engineDir + "/segment_fp16.engine");
     encodeMask_ = std::make_unique<TrtEngine>(*runtime_, engineDir + "/encode_mask_fp16.engine");
-    encodeMaskShallow_ = std::make_unique<TrtEngine>(*runtime_, engineDir + "/encode_mask_shallow_fp16.engine");
-
     checkCuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
     allocateStaticBuffers();
     bindEngines();
@@ -82,6 +104,7 @@ void MatAnyoneRunner::allocateStaticBuffers() {
     allocateBuffer("sensory", dims({1, 1, 256, 45, 80}), f32);
     allocateBuffer("new_sensory", dims({1, 1, 256, 45, 80}), f32);
     allocateBuffer("obj_memory", dims({1, 1, 1, 16, 257}), f32);
+    allocateBuffer("pixel_memory", dims({1, 1, 256, 45, 80}), f32);
     allocateBuffer("memory_readout", dims({1, 1, 256, 45, 80}), f32);
     allocateBuffer("mask_value", dims({1, 1, 256, 45, 80}), f32);
     allocateBuffer("object_summaries", dims({1, 1, 16, 257}), f32);
@@ -110,7 +133,16 @@ void MatAnyoneRunner::bindEngines() {
     read_->bind("input_8", buffers_.at("last_msk_value").ptr.get());
     read_->bind("input_9", buffers_.at("sensory").ptr.get());
     read_->bind("input_10", buffers_.at("obj_memory").ptr.get());
+    read_->bind("pixel_memory", buffers_.at("pixel_memory").ptr.get());
     read_->bind("memory_readout", buffers_.at("memory_readout").ptr.get());
+
+    if (pixelFusion_) {
+        pixelFusion_->bind("input_0", buffers_.at("pix_feat").ptr.get());
+        pixelFusion_->bind("input_1", buffers_.at("pixel_memory").ptr.get());
+        pixelFusion_->bind("input_2", buffers_.at("sensory").ptr.get());
+        pixelFusion_->bind("input_3", buffers_.at("last_mask").ptr.get());
+        pixelFusion_->bind("fused_pixel", buffers_.at("memory_readout").ptr.get());
+    }
 
     segment_->bind("input_0", buffers_.at("f16").ptr.get());
     segment_->bind("input_1", buffers_.at("f8").ptr.get());
@@ -130,10 +162,6 @@ void MatAnyoneRunner::bindEngines() {
     encodeMask_->bind("new_sensory", buffers_.at("sensory").ptr.get());
     encodeMask_->bind("object_summaries", buffers_.at("object_summaries").ptr.get());
 
-    encodeMaskShallow_->bind("input_0", buffers_.at("image").ptr.get());
-    encodeMaskShallow_->bind("input_1", buffers_.at("pix_feat").ptr.get());
-    encodeMaskShallow_->bind("input_3", buffers_.at("alpha").ptr.get());
-    encodeMaskShallow_->bind("mask_value", buffers_.at("last_msk_value").ptr.get());
 }
 
 void MatAnyoneRunner::advanceMemoryBank(bool deepUpdate) {
@@ -146,26 +174,21 @@ void MatAnyoneRunner::advanceMemoryBank(bool deepUpdate) {
     auto* memoryShrink = static_cast<std::uint8_t*>(buffers_.at("memory_shrinkage").ptr.get());
     auto* memoryValue = static_cast<std::uint8_t*>(buffers_.at("memory_value").ptr.get());
     if (memSlot_ >= 5) {
-        checkCuda(cudaMemcpyAsync(memoryKey + keyFrameBytes, memoryKey + 2 * keyFrameBytes, 3 * keyFrameBytes,
-                                  cudaMemcpyDeviceToDevice, stream_),
-                  "shift memory_key");
-        checkCuda(cudaMemcpyAsync(memoryShrink + shrinkFrameBytes, memoryShrink + 2 * shrinkFrameBytes,
-                                  3 * shrinkFrameBytes, cudaMemcpyDeviceToDevice, stream_),
-                  "shift memory_shrinkage");
-        checkCuda(cudaMemcpyAsync(memoryValue + valueFrameBytes, memoryValue + 2 * valueFrameBytes,
-                                  3 * valueFrameBytes, cudaMemcpyDeviceToDevice, stream_),
-                  "shift memory_value");
+        for (int dst = 1; dst < 4; ++dst) {
+            const int src = dst + 1;
+            copyTimeSlotToSlot(memoryKey, dst, src, 64, stream_, "shift memory_key slot");
+            checkCuda(cudaMemcpyAsync(memoryShrink + dst * shrinkFrameBytes, memoryShrink + src * shrinkFrameBytes,
+                                      shrinkFrameBytes, cudaMemcpyDeviceToDevice, stream_),
+                      "shift memory_shrinkage slot");
+            copyTimeSlotToSlot(memoryValue, dst, src, 256, stream_, "shift memory_value slot");
+        }
     }
 
-    checkCuda(cudaMemcpyAsync(memoryKey + slot * keyFrameBytes, buffers_.at("key").ptr.get(), keyFrameBytes,
-                              cudaMemcpyDeviceToDevice, stream_),
-              "copy memory_key slot");
+    copyTimeSlotFromContiguous(memoryKey, slot, buffers_.at("key").ptr.get(), 64, stream_, "copy memory_key slot");
     checkCuda(cudaMemcpyAsync(memoryShrink + slot * shrinkFrameBytes, buffers_.at("shrinkage").ptr.get(), shrinkFrameBytes,
                               cudaMemcpyDeviceToDevice, stream_),
               "copy memory_shrinkage slot");
-    checkCuda(cudaMemcpyAsync(memoryValue + slot * valueFrameBytes, buffers_.at("mask_value").ptr.get(), valueFrameBytes,
-                              cudaMemcpyDeviceToDevice, stream_),
-              "copy memory_value slot");
+    copyTimeSlotFromContiguous(memoryValue, slot, buffers_.at("mask_value").ptr.get(), 256, stream_, "copy memory_value slot");
     checkCuda(cudaMemcpyAsync(buffers_.at("last_msk_value").ptr.get(), buffers_.at("mask_value").ptr.get(), valueFrameBytes,
                               cudaMemcpyDeviceToDevice, stream_),
               "copy last_msk_value");
@@ -191,15 +214,11 @@ void MatAnyoneRunner::seedMemoryBank() {
     auto* memoryShrink = static_cast<std::uint8_t*>(buffers_.at("memory_shrinkage").ptr.get());
     auto* memoryValue = static_cast<std::uint8_t*>(buffers_.at("memory_value").ptr.get());
     for (int slot = 0; slot < 5; ++slot) {
-        checkCuda(cudaMemcpyAsync(memoryKey + slot * keyFrameBytes, buffers_.at("key").ptr.get(), keyFrameBytes,
-                                  cudaMemcpyDeviceToDevice, stream_),
-                  "seed memory_key");
+        copyTimeSlotFromContiguous(memoryKey, slot, buffers_.at("key").ptr.get(), 64, stream_, "seed memory_key");
         checkCuda(cudaMemcpyAsync(memoryShrink + slot * shrinkFrameBytes, buffers_.at("shrinkage").ptr.get(),
                                   shrinkFrameBytes, cudaMemcpyDeviceToDevice, stream_),
                   "seed memory_shrinkage");
-        checkCuda(cudaMemcpyAsync(memoryValue + slot * valueFrameBytes, buffers_.at("mask_value").ptr.get(), valueFrameBytes,
-                                  cudaMemcpyDeviceToDevice, stream_),
-                  "seed memory_value");
+        copyTimeSlotFromContiguous(memoryValue, slot, buffers_.at("mask_value").ptr.get(), 256, stream_, "seed memory_value");
     }
     checkCuda(cudaMemcpyAsync(buffers_.at("obj_memory").ptr.get(), buffers_.at("object_summaries").ptr.get(),
                               1ULL * 1ULL * 16ULL * 257ULL * sizeof(float), cudaMemcpyDeviceToDevice, stream_),
@@ -246,12 +265,12 @@ void MatAnyoneRunner::CopyAlphaToHost(float* alphaNchw) {
 void MatAnyoneRunner::ProcessFrame(bool memoryUpdate) {
     encode_->enqueue(stream_);
     read_->enqueue(stream_);
+    if (pixelFusion_) {
+        pixelFusion_->enqueue(stream_);
+    }
     segment_->enqueue(stream_);
     if (memoryUpdate) {
         encodeMask_->enqueue(stream_);
         advanceMemoryBank(true);
-    } else {
-        encodeMaskShallow_->enqueue(stream_);
-        advanceMemoryBank(false);
     }
 }

@@ -1,5 +1,6 @@
 .venv/
 models/*.pth
+models/**/*.pt
 models/*.onnx
 models/**/*.onnx
 models/**/*.onnx.data

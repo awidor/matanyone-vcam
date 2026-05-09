@@ -1,8 +1,16 @@
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
+
+# Keep CPU helper libraries from spin-waiting on a full worker pool while
+# TensorRT owns the inference path on CUDA.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
@@ -16,6 +24,10 @@ from matanyone2.utils.inference_utils import gen_dilate, gen_erosion
 WIDTH = 1280
 HEIGHT = 720
 FRAME_BYTES = WIDTH * HEIGHT * 3
+
+cv2.setNumThreads(1)
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 
 def run_json(cmd):
