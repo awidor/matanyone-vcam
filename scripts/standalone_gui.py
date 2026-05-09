@@ -301,7 +301,7 @@ class Sam21MaskDialog(QtWidgets.QDialog):
 
 
 class Worker(QtCore.QThread):
-    frame_ready = QtCore.Signal(object, float)
+    frame_ready = QtCore.Signal(object, object)
     status = QtCore.Signal(str)
     finished_cleanly = QtCore.Signal()
 
@@ -356,8 +356,14 @@ class Worker(QtCore.QThread):
             frame = first
             while frame is not None and not self.stop_requested:
                 start = time.perf_counter()
+                pre_ms = infer_ms = state_ms = composite_ms = vcam_send_ms = vcam_sleep_ms = 0.0
                 if frame_index > 0:
+                    t = time.perf_counter()
                     pipeline.tensors["image"].copy_(frame_to_tensor(frame))
+                    torch.cuda.synchronize()
+                    pre_ms = (time.perf_counter() - t) * 1000.0
+
+                    t = time.perf_counter()
                     if frame_index % self.config["mem_every"] == 0:
                         pipeline.run_memory_update(torch.cuda.current_stream().cuda_stream)
                         self.update_memory_slot(pipeline, memory_slot)
@@ -365,15 +371,36 @@ class Worker(QtCore.QThread):
                     else:
                         pipeline.run_normal(torch.cuda.current_stream().cuda_stream)
                     torch.cuda.synchronize()
+                    infer_ms = (time.perf_counter() - t) * 1000.0
+
+                    t = time.perf_counter()
                     pipeline.tensors["last_pix_feat"].copy_(pipeline.tensors["pix_feat"])
                     pipeline.tensors["last_mask"].copy_(pipeline.tensors["alpha"])
+                    torch.cuda.synchronize()
+                    state_ms = (time.perf_counter() - t) * 1000.0
 
+                t = time.perf_counter()
                 out = composite(frame, pipeline.tensors["alpha"], self.config["bg_color"])
+                composite_ms = (time.perf_counter() - t) * 1000.0
                 if vcam is not None:
+                    t = time.perf_counter()
                     vcam.send(out)
+                    vcam_send_ms = (time.perf_counter() - t) * 1000.0
+                    t = time.perf_counter()
                     vcam.sleep_until_next_frame()
+                    vcam_sleep_ms = (time.perf_counter() - t) * 1000.0
                 elapsed = (time.perf_counter() - start) * 1000.0
-                self.frame_ready.emit(out, elapsed)
+                profile = {
+                    "total": elapsed,
+                    "pre": pre_ms,
+                    "infer": infer_ms,
+                    "state": state_ms,
+                    "composite": composite_ms,
+                    "vcam_send": vcam_send_ms,
+                    "vcam_sleep": vcam_sleep_ms,
+                    "compute_total": elapsed - vcam_sleep_ms,
+                }
+                self.frame_ready.emit(out, profile)
                 frame_index += 1
                 frame = reader.read()
             self.finished_cleanly.emit()
@@ -487,11 +514,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(False)
         self.status_bar.setText("Stopped")
 
-    def on_frame(self, frame_bgr, ms):
+    def on_frame(self, frame_bgr, profile):
         rgb = cv2.cvtColor(cv2.resize(frame_bgr, (960, 540)), cv2.COLOR_BGR2RGB)
         qimage = QtGui.QImage(rgb.data, 960, 540, 960 * 3, QtGui.QImage.Format_RGB888).copy()
         self.preview.setPixmap(QtGui.QPixmap.fromImage(qimage))
-        self.status_bar.setText(f"{ms:.1f} ms")
+        if isinstance(profile, dict):
+            self.status_bar.setText(
+                f"total {profile['total']:.1f} ms | compute {profile['compute_total']:.1f} "
+                f"(pre {profile['pre']:.1f}, infer {profile['infer']:.1f}, state {profile['state']:.1f}, "
+                f"comp {profile['composite']:.1f}, send {profile['vcam_send']:.1f}) | wait {profile['vcam_sleep']:.1f}"
+            )
+        else:
+            self.status_bar.setText(f"{profile:.1f} ms")
 
 
 def main():

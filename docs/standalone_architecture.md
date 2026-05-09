@@ -138,3 +138,68 @@ Virtual camera backend check:
 ```text
 OBS Virtual Camera
 ```
+
+## Headless Latency Benchmark
+
+The desktop GUI status can report about `60 ms/frame`, while TensorRT-only benchmark scripts report roughly `22-30 ms/frame`. These are measuring different scopes:
+
+- TensorRT benchmark: model pipeline execution on CUDA.
+- GUI/app loop: frame ingest, CPU→GPU conversion, TensorRT inference, state copies, GPU→CPU alpha readback, CPU compositing, preview/virtual-camera work, and virtual-camera pacing wait.
+
+Use the headless app-loop benchmark to measure this programmatically without UI:
+
+```powershell
+uv run python scripts\bench_standalone_no_ui.py --synthetic --frames 300 --warmup 30
+```
+
+Useful variants:
+
+```powershell
+# Isolate processing without FFmpeg/camera input and without compositing.
+uv run python scripts\bench_standalone_no_ui.py --synthetic --frames 300 --warmup 30 --no-composite
+
+# Loop a real video input through FFmpeg, but still avoid UI.
+uv run python scripts\bench_standalone_no_ui.py --input vendor\MatAnyone2\inputs\video\test-sample2.mp4 --frames 300 --warmup 30
+
+# Benchmark a DirectShow camera input.
+uv run python scripts\bench_standalone_no_ui.py --camera "Camera Device Name" --frames 300 --warmup 30
+```
+
+The script emits both human-readable values and `METRIC` lines for automated optimization:
+
+```text
+METRIC read_mean_ms=...
+METRIC pre_mean_ms=...
+METRIC infer_mean_ms=...
+METRIC state_mean_ms=...
+METRIC composite_mean_ms=...
+METRIC total_mean_ms=...
+```
+
+Metric meanings:
+
+- `read`: reading/decoding or generating the next frame.
+- `pre`: BGR→RGB, NumPy→Torch, CPU→GPU copy, float normalization.
+- `infer`: TensorRT MatAnyone pipeline plus memory-update path when scheduled.
+- `state`: persistent tensor copies (`last_pix_feat`, `last_mask`, etc.).
+- `composite`: current CPU composite path, including `alpha.cpu().numpy()` GPU readback.
+- `total`: full headless processing loop excluding UI preview and virtual-camera pacing.
+
+Initial synthetic-frame measurements showed:
+
+```text
+--no-composite total_mean_ms ≈ 27.8
+with composite total_mean_ms ≈ 62.7
+composite_mean_ms ≈ 33.7
+infer_mean_ms ≈ 24.4
+```
+
+Conclusion: the observed ~60 ms app latency is mostly compositing/readback overhead, not TensorRT inference. The next optimization target should be replacing `composite()` with a GPU path or otherwise avoiding per-frame `alpha.cpu().numpy()` and float NumPy blending.
+
+The GUI status bar also reports a breakdown:
+
+```text
+total X ms | compute Y (pre A, infer B, state C, comp D, send E) | wait Z
+```
+
+`wait` is virtual-camera frame pacing (`sleep_until_next_frame`) and should not be compared to model benchmark latency.
