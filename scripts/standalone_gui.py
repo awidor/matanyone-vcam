@@ -20,6 +20,7 @@ import torch
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from bench_trt_pipeline import Pipeline
+from composite_utils import composite_bgr_on_cpu, composite_rgb_tensor_to_bgr
 
 
 WIDTH = 1280
@@ -163,13 +164,7 @@ def rerun_sam21_prompt(predictor, fg_pts, bg_pts, mask):
 
 
 def composite(frame_bgr, alpha, color):
-    frame = frame_bgr.astype(np.float32) / 255.0
-    a = alpha[0, 0].detach().clamp(0, 1).cpu().numpy()[..., None]
-    bg = np.zeros_like(frame)
-    bg[..., 0] = color[0] / 255.0
-    bg[..., 1] = color[1] / 255.0
-    bg[..., 2] = color[2] / 255.0
-    return np.clip((frame * a + bg * (1.0 - a)) * 255.0, 0, 255).astype(np.uint8)
+    return composite_bgr_on_cpu(frame_bgr, alpha, color)
 
 
 def open_virtual_camera():
@@ -380,7 +375,7 @@ class Worker(QtCore.QThread):
                     state_ms = (time.perf_counter() - t) * 1000.0
 
                 t = time.perf_counter()
-                out = composite(frame, pipeline.tensors["alpha"], self.config["bg_color"])
+                out = composite_rgb_tensor_to_bgr(pipeline.tensors["image"], pipeline.tensors["alpha"], self.config["bg_color"])
                 composite_ms = (time.perf_counter() - t) * 1000.0
                 if vcam is not None:
                     t = time.perf_counter()

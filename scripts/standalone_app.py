@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from bench_trt_pipeline import Pipeline
+from composite_utils import composite_bgr_on_cpu, composite_rgb_tensor_to_bgr
 from matanyone2.utils.inference_utils import gen_dilate, gen_erosion
 
 cv2.setNumThreads(1)
@@ -41,14 +42,8 @@ def load_mask(path):
 
 
 def composite(frame_bgr, alpha, color):
-    frame = cv2.resize(frame_bgr, (1280, 720), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-    a = alpha[0, 0].detach().clamp(0, 1).cpu().numpy()[..., None]
-    bg = np.zeros_like(frame)
-    bg[..., 0] = color[0] / 255.0
-    bg[..., 1] = color[1] / 255.0
-    bg[..., 2] = color[2] / 255.0
-    out = frame * a + bg * (1.0 - a)
-    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    frame = cv2.resize(frame_bgr, (1280, 720), interpolation=cv2.INTER_LINEAR)
+    return composite_bgr_on_cpu(frame, alpha, color)
 
 
 def open_capture(args):
@@ -130,7 +125,7 @@ def main():
             pipeline.tensors["last_pix_feat"].copy_(pipeline.tensors["pix_feat"])
             pipeline.tensors["last_mask"].copy_(pipeline.tensors["alpha"])
 
-        out = composite(frame, pipeline.tensors["alpha"], color)
+        out = composite_rgb_tensor_to_bgr(pipeline.tensors["image"], pipeline.tensors["alpha"], color)
         writer.write(out)
         if args.preview:
             cv2.imshow("MatAnyone Standalone", out)
