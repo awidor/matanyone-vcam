@@ -71,7 +71,7 @@ The app supports:
 
 - Video file input through FFmpeg.
 - DirectShow camera input through FFmpeg.
-- SAM2.1 click target mask on the first frame.
+- SAM3.1 click target mask on the first frame.
 - Mask file input.
 - Auto-center and green-screen placeholder masks.
 - Live preview.
@@ -94,16 +94,26 @@ Generate a first-frame image and draw a mask:
 
 ```powershell
 uv run python scripts\extract_first_frame_ffmpeg.py --input input.mp4 --output output\first_frame.png
-uv run python scripts\make_initial_mask_sam21.py --image output\first_frame.png --output output\initial_mask.png
+uv run python scripts\make_initial_mask_sam31.py --image output\first_frame.png --output output\initial_mask.png
 ```
 
-In the standalone GUI, choose `SAM2.1 Click` and left-click the subject once on the first frame. Right-click background areas only if the mask needs refinement.
+In the standalone GUI, left-click the subject once on the first frame. Right-click background areas only if the mask needs refinement.
 
 In the helper mask UI: left-click = foreground point, right-click = background point, `s` saves, `c` clears all points, `z` undoes last click, `q`/Esc exits.
 
-### First-time SAM2.1 setup
+### First-time SAM3.1 setup
 
-SAM2.1 checkpoints are public. Download `sam2.1_hiera_large.pt` from <https://github.com/facebookresearch/sam2> and place it at `models\sam2\checkpoints\sam2.1_hiera_large.pt` before first use. The tool will fail immediately if the checkpoint is not present.
+SAM3.1 runs in a worker process but uses the same `.venv` as the MatAnyone app, so it shares the existing CUDA PyTorch install instead of downloading another large torch wheel. Install the official SAM3 repository and the Windows Triton package:
+
+```powershell
+git clone https://github.com/facebookresearch/sam3.git vendor\sam3
+uv pip install --python .venv\Scripts\python.exe -e vendor\sam3 --no-deps
+uv pip install --python .venv\Scripts\python.exe timm>=1.0.17 ftfy==6.1.1 regex triton-windows
+hf auth login
+$env:SAM31_REPO = "$PWD\vendor\sam3"
+```
+
+Optional: set `SAM31_CHECKPOINT` to a local `.pt` checkpoint path to avoid Hugging Face downloads at runtime. The tool fails immediately if SAM3.1 cannot be imported, CUDA is unavailable, or the checkpoint cannot be loaded.
 
 Automatic placeholder masks are available for quick testing:
 

@@ -1,7 +1,10 @@
 import argparse
+import base64
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,8 +33,8 @@ FPS = 30.0
 BG_COLOR = (0, 180, 80)
 FFMPEG_DIR = Path("C:/Tools/ffmpeg-2026-05-06-git-f2e5eff3ff-full_build")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SAM21_CHECKPOINT = PROJECT_ROOT / "models" / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt"
-SAM21_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM31_PYTHON = os.environ.get("SAM31_PYTHON", sys.executable)
+SAM31_WORKER = PROJECT_ROOT / "scripts" / "sam31_mask_worker.py"
 
 cv2.setNumThreads(1)
 torch.set_num_threads(1)
@@ -112,6 +115,22 @@ class FFmpegReader:
             self._thread.join(timeout=1.0)
 
 
+class FramePacer:
+    def __init__(self, fps):
+        self.interval = 1.0 / fps
+        self.next_frame_time = time.perf_counter()
+
+    def sleep_until_next_frame(self):
+        self.next_frame_time += self.interval
+        now = time.perf_counter()
+        delay = self.next_frame_time - now
+        if delay <= 0:
+            self.next_frame_time = now
+            return 0.0
+        time.sleep(delay)
+        return delay * 1000.0
+
+
 def frame_to_tensor(frame_bgr):
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(rgb).permute(2, 0, 1).float().cuda().unsqueeze(0).contiguous() / 255.0
@@ -124,43 +143,78 @@ def mask_to_tensor(mask):
     return torch.from_numpy(mask).float().cuda().unsqueeze(0).unsqueeze(0).contiguous() / 255.0
 
 
-def build_sam21_predictor(frame_bgr):
-    if not SAM21_CHECKPOINT.exists():
-        raise FileNotFoundError(f"SAM2.1 checkpoint not found: {SAM21_CHECKPOINT}")
+class Sam31Client:
+    def __init__(self, frame_bgr):
+        if not SAM31_WORKER.exists():
+            raise FileNotFoundError(f"SAM3.1 worker not found: {SAM31_WORKER}")
 
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+        self._tmp = tempfile.TemporaryDirectory(prefix="matanyone_sam31_")
+        self._frame_path = Path(self._tmp.name) / "frame.png"
+        cv2.imwrite(str(self._frame_path), frame_bgr)
+        cmd = [SAM31_PYTHON, str(SAM31_WORKER), "--image", str(self._frame_path)]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._stderr = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+        ready = self._read_response()
+        if ready.get("status") != "ready":
+            raise RuntimeError(ready.get("error", "SAM3.1 worker failed to start"))
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = build_sam2(SAM21_CONFIG, str(SAM21_CHECKPOINT), device=device)
-    predictor = SAM2ImagePredictor(model)
-    predictor.set_image(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    return predictor
+    def _drain_stderr(self):
+        if self._proc.stderr is None:
+            return
+        for line in self._proc.stderr:
+            self._stderr.append(line.rstrip())
 
+    def _read_response(self):
+        if self._proc.stdout is None:
+            raise RuntimeError("SAM3.1 worker stdout is unavailable")
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                detail = "\n".join(self._stderr[-8:])
+                if detail:
+                    raise RuntimeError(f"SAM3.1 worker exited:\n{detail}")
+                raise RuntimeError("SAM3.1 worker exited")
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                self._stderr.append(line.rstrip())
+                continue
+            if isinstance(response, dict) and "status" in response:
+                return response
 
-def rerun_sam21_prompt(predictor, fg_pts, bg_pts, mask):
-    all_pts = fg_pts + bg_pts
-    all_lbls = [1] * len(fg_pts) + [0] * len(bg_pts)
-    if not all_pts:
-        mask[:] = 0
-        return
+    def predict(self, fg_pts, bg_pts):
+        if self._proc.poll() is not None:
+            detail = "\n".join(self._stderr[-8:])
+            raise RuntimeError(f"SAM3.1 worker is not running:\n{detail}")
+        payload = {"fg": fg_pts, "bg": bg_pts}
+        self._proc.stdin.write(json.dumps(payload) + "\n")
+        self._proc.stdin.flush()
+        response = self._read_response()
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("error", "SAM3.1 prompt failed"))
+        raw = base64.b64decode(response["mask"])
+        return np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH)).copy()
 
-    coords = np.array(all_pts, dtype=np.float32)
-    labels = np.array(all_lbls, dtype=np.int32)
-    with torch.inference_mode():
-        if torch.cuda.is_available():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                masks, scores, _ = predictor.predict(point_coords=coords, point_labels=labels, multimask_output=True)
-        else:
-            masks, scores, _ = predictor.predict(point_coords=coords, point_labels=labels, multimask_output=True)
-    if masks is None or len(masks) == 0:
-        mask[:] = 0
-        return
-
-    m = masks[int(np.argmax(scores))]
-    if m.shape != (HEIGHT, WIDTH):
-        m = cv2.resize(m.astype(np.uint8), (WIDTH, HEIGHT), cv2.INTER_NEAREST)
-    mask[:] = (m > 0).astype(np.uint8) * 255
+    def close(self):
+        try:
+            if self._proc.poll() is None and self._proc.stdin is not None:
+                self._proc.stdin.write(json.dumps({"quit": True}) + "\n")
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=5.0)
+        except Exception:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+        finally:
+            self._tmp.cleanup()
 
 
 def composite(frame_bgr, alpha, color):
@@ -193,17 +247,16 @@ def open_virtual_camera():
         raise RuntimeError(f"Could not open OBS Virtual Camera output: {message}") from exc
 
 
-class Sam21MaskDialog(QtWidgets.QDialog):
+class Sam31MaskDialog(QtWidgets.QDialog):
     def __init__(self, frame_bgr):
         super().__init__()
-        self.setWindowTitle("SAM2.1 Target Mask")
+        self.setWindowTitle("SAM3.1 Target Mask")
         self.frame = frame_bgr.copy()
         self.mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
         self.fg_pts = []
         self.bg_pts = []
         self.history = []
-        self.predictor = None
-        self.predictor = build_sam21_predictor(self.frame)
+        self.predictor = Sam31Client(self.frame)
 
         self.image_label = QtWidgets.QLabel()
         self.image_label.setFixedSize(960, 540)
@@ -241,13 +294,13 @@ class Sam21MaskDialog(QtWidgets.QDialog):
         self.run_prompt()
 
     def run_prompt(self):
-        self.status.setText("Running SAM2.1...")
+        self.status.setText("Running SAM3.1...")
         QtWidgets.QApplication.processEvents()
         try:
-            rerun_sam21_prompt(self.predictor, self.fg_pts, self.bg_pts, self.mask)
+            self.mask[:] = self.predictor.predict(self.fg_pts, self.bg_pts)
             self.status.setText(f"Foreground clicks: {len(self.fg_pts)}  Background clicks: {len(self.bg_pts)}")
         except Exception as exc:
-            self.status.setText(f"SAM2.1 error: {exc}")
+            self.status.setText(f"SAM3.1 error: {exc}")
         self.refresh()
 
     def clear(self):
@@ -279,9 +332,9 @@ class Sam21MaskDialog(QtWidgets.QDialog):
         self.image_label.setPixmap(QtGui.QPixmap.fromImage(qimage))
 
     def cleanup(self):
-        self.predictor = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if self.predictor is not None:
+            self.predictor.close()
+            self.predictor = None
 
     def accept(self):
         if not np.any(self.mask):
@@ -346,12 +399,13 @@ class Worker(QtCore.QThread):
             if self.config.get("output_virtual_camera", False):
                 vcam = open_virtual_camera()
 
+            pacer = FramePacer(FPS)
             frame_index = 0
             memory_slot = 1
             frame = first
             while frame is not None and not self.stop_requested:
                 start = time.perf_counter()
-                pre_ms = infer_ms = state_ms = composite_ms = vcam_send_ms = vcam_sleep_ms = 0.0
+                pre_ms = infer_ms = state_ms = composite_ms = vcam_send_ms = pacing_wait_ms = 0.0
                 if frame_index > 0:
                     t = time.perf_counter()
                     pipeline.tensors["image"].copy_(frame_to_tensor(frame))
@@ -377,13 +431,11 @@ class Worker(QtCore.QThread):
                 t = time.perf_counter()
                 out = composite_rgb_tensor_to_bgr(pipeline.tensors["image"], pipeline.tensors["alpha"], self.config["bg_color"])
                 composite_ms = (time.perf_counter() - t) * 1000.0
+                pacing_wait_ms = pacer.sleep_until_next_frame()
                 if vcam is not None:
                     t = time.perf_counter()
                     vcam.send(out)
                     vcam_send_ms = (time.perf_counter() - t) * 1000.0
-                    t = time.perf_counter()
-                    vcam.sleep_until_next_frame()
-                    vcam_sleep_ms = (time.perf_counter() - t) * 1000.0
                 elapsed = (time.perf_counter() - start) * 1000.0
                 profile = {
                     "total": elapsed,
@@ -392,8 +444,8 @@ class Worker(QtCore.QThread):
                     "state": state_ms,
                     "composite": composite_ms,
                     "vcam_send": vcam_send_ms,
-                    "vcam_sleep": vcam_sleep_ms,
-                    "compute_total": elapsed - vcam_sleep_ms,
+                    "pacing_wait": pacing_wait_ms,
+                    "compute_total": elapsed - pacing_wait_ms,
                 }
                 self.frame_ready.emit(out, profile)
                 frame_index += 1
@@ -465,9 +517,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return frame
 
     def build_mask(self, first):
-        dialog = Sam21MaskDialog(first)
+        dialog = Sam31MaskDialog(first)
         if dialog.exec() != QtWidgets.QDialog.Accepted:
-            raise RuntimeError("SAM2.1 mask selection canceled")
+            raise RuntimeError("SAM3.1 mask selection canceled")
         return dialog.mask
 
     def start(self):
@@ -513,11 +565,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rgb = cv2.cvtColor(cv2.resize(frame_bgr, (960, 540)), cv2.COLOR_BGR2RGB)
         qimage = QtGui.QImage(rgb.data, 960, 540, 960 * 3, QtGui.QImage.Format_RGB888).copy()
         self.preview.setPixmap(QtGui.QPixmap.fromImage(qimage))
+        if profile is None:
+            return
         if isinstance(profile, dict):
             self.status_bar.setText(
                 f"total {profile['total']:.1f} ms | compute {profile['compute_total']:.1f} "
                 f"(pre {profile['pre']:.1f}, infer {profile['infer']:.1f}, state {profile['state']:.1f}, "
-                f"comp {profile['composite']:.1f}, send {profile['vcam_send']:.1f}) | wait {profile['vcam_sleep']:.1f}"
+                f"comp {profile['composite']:.1f}, send {profile['vcam_send']:.1f}) | pace {profile['pacing_wait']:.1f}"
             )
         else:
             self.status_bar.setText(f"{profile:.1f} ms")
