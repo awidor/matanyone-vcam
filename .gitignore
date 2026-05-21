@@ -12,6 +12,14 @@ build/
 build_obs/
 dist/
 app/target/
+target/
+matanyone-vcam.exe
+/nvinfer_10.dll
+/nvinfer_plugin_10.dll
+/nvinfer_dispatch_10.dll
+/cudart64_13.dll
+bin/
+nul
 output/
 vendor/
 raw_sample/

@@ -1,120 +1,32 @@
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_float, c_int, c_uchar};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
-pub const MODEL_W: usize = 1280;
-pub const MODEL_H: usize = 720;
-pub const FRAME_BYTES: usize = MODEL_W * MODEL_H * 3;
-
-#[repr(C)]
-pub struct MatAnyoneSession {
-    _private: [u8; 0],
-}
-
-extern "C" {
-    fn matanyone_create(engine_dir: *const c_char) -> *mut MatAnyoneSession;
-    fn matanyone_destroy(session: *mut MatAnyoneSession);
-    fn matanyone_last_error() -> *const c_char;
-    fn matanyone_internal_width() -> c_int;
-    fn matanyone_internal_height() -> c_int;
-    fn matanyone_init_from_mask_file(
-        session: *mut MatAnyoneSession,
-        bgr: *const c_uchar,
-        src_w: c_int,
-        src_h: c_int,
-        mask_png_path: *const c_char,
-    ) -> c_int;
-    fn matanyone_init_from_mask(
-        session: *mut MatAnyoneSession,
-        bgr: *const c_uchar,
-        src_w: c_int,
-        src_h: c_int,
-        mask_hw: *const c_float,
-        mask_w: c_int,
-        mask_h: c_int,
-    ) -> c_int;
-    fn matanyone_process_bgr(
-        session: *mut MatAnyoneSession,
-        bgr_in: *const c_uchar,
-        src_w: c_int,
-        src_h: c_int,
-        bgr_out: *mut c_uchar,
-        dst_w: c_int,
-        dst_h: c_int,
-        bg_r: c_float,
-        bg_g: c_float,
-        bg_b: c_float,
-        memory_update: c_int,
-    ) -> c_int;
-    fn matanyone_reset(session: *mut MatAnyoneSession) -> c_int;
-}
-
-fn last_error() -> String {
-    unsafe {
-        let ptr = matanyone_last_error();
-        if ptr.is_null() {
-            "unknown error".to_string()
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    }
-}
+pub use matanyone_core::{MODEL_H, MODEL_W, FRAME_BYTES, center_mask};
 
 pub struct Session {
-    ptr: *mut MatAnyoneSession,
+    inner: matanyone_core::Session,
     frame_index: u64,
 }
 
 impl Session {
     pub fn new(engine_dir: &Path) -> Result<Self> {
-        let engine = CString::new(engine_dir.to_string_lossy().as_bytes())
-            .context("invalid engine directory")?;
-        let ptr = unsafe { matanyone_create(engine.as_ptr()) };
-        if ptr.is_null() {
-            bail!("matanyone_create failed: {}", last_error());
-        }
         Ok(Self {
-            ptr,
+            inner: matanyone_core::Session::new(engine_dir)?,
             frame_index: 0,
         })
     }
 
     pub fn init_from_mask_file(&mut self, bgr: &[u8], src_w: u32, src_h: u32, mask_path: &Path) -> Result<()> {
-        let mask = CString::new(mask_path.to_string_lossy().as_bytes()).context("invalid mask path")?;
-        let rc = unsafe {
-            matanyone_init_from_mask_file(
-                self.ptr,
-                bgr.as_ptr(),
-                src_w as c_int,
-                src_h as c_int,
-                mask.as_ptr(),
-            )
-        };
-        if rc != 0 {
-            bail!("matanyone_init_from_mask_file failed: {}", last_error());
-        }
+        self.inner.init_from_mask_file(bgr, src_w, src_h, mask_path)?;
         self.frame_index = 1;
         Ok(())
     }
 
     pub fn init_center_mask(&mut self, bgr: &[u8], src_w: u32, src_h: u32) -> Result<()> {
         let mask = center_mask(MODEL_W, MODEL_H);
-        let rc = unsafe {
-            matanyone_init_from_mask(
-                self.ptr,
-                bgr.as_ptr(),
-                src_w as c_int,
-                src_h as c_int,
-                mask.as_ptr(),
-                MODEL_W as c_int,
-                MODEL_H as c_int,
-            )
-        };
-        if rc != 0 {
-            bail!("matanyone_init_from_mask failed: {}", last_error());
-        }
+        self.inner
+            .init_from_mask(bgr, src_w, src_h, &mask, MODEL_W, MODEL_H)?;
         self.frame_index = 1;
         Ok(())
     }
@@ -127,69 +39,26 @@ impl Session {
         bgr_out: &mut [u8],
         bg: (f32, f32, f32),
     ) -> Result<()> {
-        let memory_update = if self.frame_index > 0 && self.frame_index % 5 == 0 {
-            1
-        } else {
-            0
-        };
-        let rc = unsafe {
-            matanyone_process_bgr(
-                self.ptr,
-                bgr_in.as_ptr(),
-                src_w as c_int,
-                src_h as c_int,
-                bgr_out.as_mut_ptr(),
-                MODEL_W as c_int,
-                MODEL_H as c_int,
-                bg.0,
-                bg.1,
-                bg.2,
-                memory_update,
-            )
-        };
-        if rc != 0 {
-            bail!("matanyone_process_bgr failed: {}", last_error());
-        }
+        let memory_update = self.frame_index > 0 && self.frame_index % 5 == 0;
+        self.inner.process_bgr(
+            bgr_in,
+            src_w,
+            src_h,
+            bgr_out,
+            MODEL_W as u32,
+            MODEL_H as u32,
+            bg,
+            memory_update,
+        )?;
         self.frame_index += 1;
         Ok(())
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        let rc = unsafe { matanyone_reset(self.ptr) };
-        if rc != 0 {
-            bail!("matanyone_reset failed: {}", last_error());
-        }
+        self.inner.reset()?;
         self.frame_index = 0;
         Ok(())
     }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        unsafe {
-            matanyone_destroy(self.ptr);
-        }
-    }
-}
-
-unsafe impl Send for Session {}
-
-pub fn center_mask(w: usize, h: usize) -> Vec<f32> {
-    let mut mask = vec![0.0f32; w * h];
-    let cx = w as f32 * 0.5;
-    let cy = h as f32 * 0.5;
-    let rx = w as f32 * 0.22;
-    let ry = h as f32 * 0.35;
-    for y in 0..h {
-        for x in 0..w {
-            let dx = (x as f32 - cx) / rx;
-            let dy = (y as f32 - cy) / ry;
-            if dx * dx + dy * dy <= 1.0 {
-                mask[y * w + x] = 1.0;
-            }
-        }
-    }
-    mask
 }
 
 pub fn bgr_to_rgb(bgr: &[u8], rgb: &mut [u8]) {

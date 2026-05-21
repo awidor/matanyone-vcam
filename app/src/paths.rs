@@ -29,11 +29,8 @@ pub fn bundle_root(install_root: &Path) -> PathBuf {
         return install_root.to_path_buf();
     }
 
-    // Developer layout: exe in app/target/release, repo root is ../../..
-    let dev_root = install_root
-        .join("..")
-        .join("..")
-        .join("..");
+    // Developer layout: exe in target/release (cargo run) — repo root is ../..
+    let dev_root = install_root.join("..").join("..");
     if dev_root.join("scripts").join("sam31_mask_worker.py").exists() {
         if let Ok(canonical) = dev_root.canonicalize() {
             return canonical;

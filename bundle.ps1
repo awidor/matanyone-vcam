@@ -15,8 +15,12 @@ if (-not $TensorRtRoot) { $TensorRtRoot = "C:\Tools\TensorRT-10.16.1.11" }
 if (-not $CudaRoot) { $CudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1" }
 
 $DistRoot = if ($OutDir) { $OutDir } else { Join-Path $Root "dist\matanyone-vcam-win64" }
-$ExeSrc = Join-Path $Root "app\target\$($BuildType.ToLower())\matanyone-vcam.exe"
+$ExeSrc = Join-Path $Root "matanyone-vcam.exe"
+if (-not (Test-Path $ExeSrc)) {
+    $ExeSrc = Join-Path $Root "target\$($BuildType.ToLower())\matanyone-vcam.exe"
+}
 $EnginesSrc = Join-Path $Root "engines\faithful"
+$SamEnginesSrc = Join-Path $Root "engines\sam31"
 
 if (-not $SkipBuild) {
     & (Join-Path $Root "build.ps1") -Release:$Release
@@ -34,31 +38,22 @@ New-Item -ItemType Directory -Path $DistRoot | Out-Null
 
 Copy-Item $ExeSrc (Join-Path $DistRoot "matanyone-vcam.exe")
 
-$TrtBin = Join-Path $TensorRtRoot "bin"
-$CudaBin = Join-Path $CudaRoot "bin\x64"
-$RuntimeDlls = @(
-    @{ Name = "nvinfer_10.dll"; Source = $TrtBin },
-    @{ Name = "nvinfer_plugin_10.dll"; Source = $TrtBin },
-    @{ Name = "nvinfer_dispatch_10.dll"; Source = $TrtBin },
-    @{ Name = "cudart64_13.dll"; Source = $CudaBin }
-)
-
-foreach ($entry in $RuntimeDlls) {
-    $src = Join-Path $entry.Source $entry.Name
-    if (-not (Test-Path $src)) {
-        throw "Required runtime DLL not found: $src"
-    }
-    Copy-Item $src $DistRoot
-    Write-Host "  copied $($entry.Name)"
-}
+& (Join-Path $Root "scripts\copy_runtime_dlls.ps1") -DestDir $DistRoot -TensorRtRoot $TensorRtRoot -CudaRoot $CudaRoot
 
 if (Test-Path $EnginesSrc) {
     $engineDest = Join-Path $DistRoot "engines\faithful"
     New-Item -ItemType Directory -Path $engineDest -Force | Out-Null
     Copy-Item (Join-Path $EnginesSrc "*.engine") $engineDest
-    Write-Host "  copied TensorRT engines"
+    Write-Host "  copied TensorRT engines (faithful)"
 } else {
     Write-Warning "engines/faithful not found - bundle will not include .engine files"
+}
+
+if (Test-Path $SamEnginesSrc) {
+    $samDest = Join-Path $DistRoot "engines\sam31"
+    New-Item -ItemType Directory -Path $samDest -Force | Out-Null
+    Copy-Item (Join-Path $SamEnginesSrc "*.engine") $samDest -ErrorAction SilentlyContinue
+    Write-Host "  copied SAM31 engines (if any)"
 }
 
 $ReadmeLines = @(

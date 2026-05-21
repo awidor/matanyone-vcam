@@ -1,0 +1,17 @@
+{
+  "matanyone_trt_bench": {
+    "normal_mean_ms": 21.28,
+    "normal_p99_ms": 24.66,
+    "memory_update_mean_ms": 23.28,
+    "memory_update_p99_ms": 27.03
+  },
+  "matanyone_runner_bench": {
+    "mixed_mean_ms": 21.05,
+    "mixed_p99_ms": 23.22
+  },
+  "matanyone_runner_raw": {
+    "mean_ms": 24.74,
+    "p99_ms": 37.93
+  },
+  "sam_click_mean_ms": null
+}

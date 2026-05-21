@@ -2,7 +2,7 @@
 
 **Goal**: Real-time AI video matting (subject extraction) as a standalone Windows app with virtual camera output, running on the local RTX 3080.
 
-**Primary deliverable**: Rust desktop app (`app/matanyone-vcam`) backed by C++ TensorRT core (`core/`).
+**Primary deliverable**: Rust workspace — `matanyone-vcam` app + `matanyone-core` crate (TensorRT/CUDA inference).
 
 **Non-goals**: OBS plugin, cross-GPU support, 4K, multi-person tracking, Linux/Mac.
 
@@ -15,8 +15,8 @@
 ```text
 Webcam (MSMF / nokhwa)
   -> Rust worker thread
-  -> matanyone_core C API
-       BGR -> CUDA preprocess -> MatAnyoneRunner (TensorRT)
+  -> matanyone_core::Session
+       BGR -> CUDA cubin preprocess -> MatAnyoneRunner (TensorRT)
        -> alpha composite -> BGR readback
   -> egui preview + virtualcam (UnityCapture)
 ```
@@ -24,12 +24,26 @@ Webcam (MSMF / nokhwa)
 ## Build & bundle
 
 ```powershell
-.\build.ps1              # dev build
+.\build.ps1              # cargo build --release; copies exe + TensorRT/CUDA DLLs to repo root
 .\build.ps1 -Bundle      # portable folder in dist/matanyone-vcam-win64/
 .\build.ps1 -Bundle -Zip # same + zip archive
 ```
 
-The bundle includes `matanyone-vcam.exe`, TensorRT/CUDA runtime DLLs, and `engines/faithful/`. Paths are resolved relative to the executable.
+After build, run from the repo root (no PATH setup needed — runtime DLLs sit beside the exe):
+
+```powershell
+.\matanyone-vcam.exe
+# or
+.\run_vcam.ps1           # optional; sets PATH if you prefer
+```
+
+Dev/bench binaries land in `bin/` with the same runtime DLLs (also under `target/release/`). The bundle includes `matanyone-vcam.exe`, TensorRT/CUDA runtime DLLs, and `engines/faithful/`. Paths are resolved relative to the executable.
+
+Benchmark parity (RTX 3080 baselines in `docs/benchmark_baselines.json`):
+
+```powershell
+.\scripts\check_bench_parity.ps1
+```
 
 ---
 
@@ -37,8 +51,10 @@ The bundle includes `matanyone-vcam.exe`, TensorRT/CUDA runtime DLLs, and `engin
 
 | Layer | Path | Notes |
 |-------|------|-------|
-| Rust UI + I/O | `app/` | egui, nokhwa, virtualcam, SAM subprocess |
-| C++ inference | `core/` | TensorRT runner, CUDA cubin kernels, C API |
+| User-facing exe | `./matanyone-vcam.exe` | Copied to repo root by `build.ps1` |
+| Rust UI + I/O | `app/` | egui, nokhwa, virtualcam |
+| Rust inference | `crates/matanyone-core/` | TensorRT runner, CUDA cubin, Session API |
+| Dev/bench tools | `bin/` | smoke + bench exes (copied from `target/release/`) |
 | Engine tooling | `scripts/` | Export, bench, Python reference GUI |
 | Engines | `engines/faithful/` | FP16 TensorRT engines |
 
@@ -46,14 +62,14 @@ The bundle includes `matanyone-vcam.exe`, TensorRT/CUDA runtime DLLs, and `engin
 
 ## Status
 
-- [x] C++ core extracted from OBS plugin with stable C API
-- [x] Core smoke test (`matanyone_core_smoke`)
+- [x] Rust `matanyone-core` with TensorRT runner + CUDA kernels (C++ core removed)
+- [x] Core smoke test (`.\bin\matanyone_core_smoke.exe --synthetic engines\faithful`)
 - [x] Rust app with capture, inference, preview, virtual camera
-- [x] SAM3.1 click-to-mask via Python worker subprocess
+- [x] SAM3.1 click-to-mask via `sam-python` feature (default); TRT export spike pending
 - [x] OBS plugin code removed
 
 ---
 
 ## Historical Note
 
-This repo previously targeted an OBS Studio filter plugin. That path has been retired in favor of the standalone virtual camera app above. Python standalone GUI scripts remain for development.
+This repo previously targeted an OBS Studio filter plugin and a C++ `core/` static library. That path has been retired in favor of the Rust workspace above. Python standalone GUI scripts remain for development.
