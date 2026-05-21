@@ -1,5 +1,5 @@
 [project]
-name = "matanyone-obs"
+name = "matanyone-vcam"
 version = "0.1.0"
 requires-python = ">=3.10,<3.11"
 dependencies = [

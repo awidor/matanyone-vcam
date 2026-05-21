@@ -746,7 +746,7 @@ wheels = [
 ]
 
 [[package]]
-name = "matanyone-obs"
+name = "matanyone-vcam"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
