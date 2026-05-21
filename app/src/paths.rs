@@ -1,5 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Directory containing the running executable (portable install root).
 pub fn install_root() -> PathBuf {
@@ -38,4 +39,36 @@ pub fn bundle_root(install_root: &Path) -> PathBuf {
     }
 
     install_root.to_path_buf()
+}
+
+/// FFmpeg executable used for DirectShow capture (OBS Virtual Camera, etc.).
+pub fn find_ffmpeg() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("FFMPEG_DIR") {
+        let root = PathBuf::from(&dir);
+        let candidate = root.join("bin").join("ffmpeg.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        let candidate = root.join("ffmpeg.exe");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let default = PathBuf::from(r"C:\Tools\ffmpeg-2026-05-06-git-f2e5eff3ff-full_build\bin\ffmpeg.exe");
+    if default.is_file() {
+        return Some(default);
+    }
+
+    let output = Command::new("where").arg("ffmpeg").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.lines().next()?.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
 }

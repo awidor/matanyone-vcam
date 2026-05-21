@@ -16,7 +16,7 @@ use eframe::egui;
 use parking_lot::Mutex;
 use tray_icon::{Icon, TrayIconBuilder, menu::{Menu, MenuItem}};
 
-use crate::capture::CameraCapture;
+use crate::capture::{CameraCapture, CameraEntry};
 use crate::core::{FRAME_BYTES, MODEL_H, MODEL_W, Session, bgr_to_rgb};
 use crate::vcam::VirtualCamera;
 
@@ -102,7 +102,7 @@ struct MatAnyoneApp {
     preview: PreviewState,
     worker: Option<WorkerControl>,
     frame_poll: Option<FramePoll>,
-    cameras: Vec<String>,
+    cameras: Vec<CameraEntry>,
     vcam_device: String,
     tray: Option<tray_icon::TrayIcon>,
     show_window: bool,
@@ -152,6 +152,18 @@ impl MatAnyoneApp {
             return;
         }
 
+        let Some(camera_entry) = self.cameras.get(self.settings.camera_index).cloned() else {
+            self.preview.status = "Select a camera first.".to_string();
+            return;
+        };
+        let enable_vcam = self.settings.enable_vcam;
+        if enable_vcam && camera_entry.is_obs_virtual_camera() {
+            self.preview.status = "OBS Virtual Camera cannot be both input and output. \
+                Disable virtual-camera output or choose a different input."
+                .to_string();
+            return;
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
         self.worker = Some(WorkerControl {
@@ -161,8 +173,7 @@ impl MatAnyoneApp {
 
         let engine_dir = PathBuf::from(self.settings.engine_dir.clone());
         let mask_path = self.settings.mask_path.clone();
-        let camera_index = self.settings.camera_index;
-        let enable_vcam = self.settings.enable_vcam;
+        let camera_name = camera_entry.name.clone();
         let bg = self.settings.bg_color;
         let use_center_mask = self.settings.use_center_mask || mask_path.is_none();
         let sam_fg = self.settings.sam_fg_points.clone();
@@ -184,7 +195,7 @@ impl MatAnyoneApp {
         thread::spawn(move || {
             let worker_result = (|| -> Result<()> {
                 let mut session = Session::new(&engine_dir)?;
-                let mut camera = CameraCapture::open(camera_index)?;
+                let mut camera = CameraCapture::open(&camera_entry)?;
                 let mut out = vec![0u8; FRAME_BYTES];
                 let mut rgb_preview = vec![0u8; FRAME_BYTES];
                 let mut initialized = false;
@@ -239,7 +250,7 @@ impl MatAnyoneApp {
                     let fps = if ms > 0.0 { 1000.0 / ms } else { 0.0 };
                     *metrics_slot.lock() = (fps, ms);
                     *status_slot.lock() = format!(
-                        "Running frame={frame_index} camera={camera_index} vcam={}",
+                        "Running frame={frame_index} camera={camera_name} vcam={}",
                         if enable_vcam { "on" } else { "off" }
                     );
 
@@ -343,7 +354,6 @@ impl eframe::App for MatAnyoneApp {
                 };
             }
             ui.checkbox(&mut self.settings.use_center_mask, "Use center placeholder mask");
-            ui.checkbox(&mut self.settings.enable_vcam, "Publish to virtual camera");
             ui.label("Background color (BGR)");
             ui.color_edit_button_srgb(&mut self.settings.bg_color);
 
@@ -353,17 +363,31 @@ impl eframe::App for MatAnyoneApp {
                 .selected_text(
                     self.cameras
                         .get(self.settings.camera_index)
-                        .cloned()
-                        .unwrap_or_else(|| format!("Camera {}", self.settings.camera_index)),
+                        .map(|entry| entry.name.as_str())
+                        .unwrap_or("Select a camera"),
                 )
                 .show_ui(ui, |ui| {
-                    for (idx, name) in self.cameras.iter().enumerate() {
-                        ui.selectable_value(&mut self.settings.camera_index, idx, name);
+                    for (idx, entry) in self.cameras.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.camera_index, idx, &entry.name);
                     }
                 });
             if ui.button("Refresh cameras").clicked() {
                 self.cameras = CameraCapture::list_devices().unwrap_or_default();
+                if self.settings.camera_index >= self.cameras.len() && !self.cameras.is_empty() {
+                    self.settings.camera_index = 0;
+                }
             }
+            if self.cameras.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "No cameras found. Start OBS Virtual Camera or connect a webcam, then refresh.",
+                );
+            }
+            ui.label("DirectShow devices (e.g. OBS Virtual Camera) require ffmpeg on PATH or FFMPEG_DIR.");
+            ui.checkbox(
+                &mut self.settings.enable_vcam,
+                "Publish to virtual camera (turn off when using OBS Virtual Camera as input)",
+            );
 
             ui.separator();
             ui.checkbox(&mut self.settings.sam_mode, "SAM3.1 click mode (first frame)");
