@@ -29,3 +29,7 @@ torchvision = { index = "pytorch-cu128" }
 
 [tool.setuptools]
 py-modules = []
+
+[tool.uv]
+# matanyone2 force-includes matanyone2/config, which hatchling >= 1.26 rejects as a duplicate wheel entry.
+build-constraint-dependencies = ["hatchling<1.26"]

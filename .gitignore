@@ -18,7 +18,7 @@ matanyone-vcam.exe
 /nvinfer_plugin_10.dll
 /nvinfer_dispatch_10.dll
 /cudart64_13.dll
-bin/
+/bin/
 nul
 output/
 vendor/
