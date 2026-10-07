@@ -1,10 +1,13 @@
 from pathlib import Path
+import math
 import urllib.request
 
 import torch
 import torch.nn.functional as F
 
+from matanyone2.model.transformer.object_transformer import QueryTransformer
 from matanyone2.model.utils.memory_utils import do_softmax, get_similarity
+from matanyone2.utils.tensor_utils import aggregate
 from matanyone2.utils.get_default_model import get_matanyone2_model
 
 
@@ -57,11 +60,62 @@ class MemoryReadout(torch.nn.Module):
         return readout.view(bs, num_objects, value_dim, h, w)
 
 
+class MemoryReadoutQueryMajor(torch.nn.Module):
+    """MemoryReadout(top_k=None) laid out as plain attention for TensorRT.
+
+    The anisotropic L2 similarity -a^2 + 2ab - b^2 (scaled by shrinkage) becomes one
+    dot product over K = 2*CK + 1 (padded to a multiple of 8), so the distance is
+    accumulated inside a single GEMM, and the softmax runs over the contiguous memory
+    axis instead of a strided one.
+    """
+
+    def forward(self, query_key, query_selection, memory_key, memory_shrinkage, memory_value):
+        bs, num_objects, value_dim, _, h, w = memory_value.shape
+        ck = memory_key.shape[1]
+        mk = memory_key.flatten(start_dim=2)  # B, CK, N
+        ms = memory_shrinkage.flatten(start_dim=2)  # B, 1, N
+        qk = query_key.flatten(start_dim=2)  # B, CK, HW
+        qe = query_selection.flatten(start_dim=2)  # B, CK, HW
+
+        b_sq = (qe * qk.pow(2)).sum(1, keepdim=True)
+        query = torch.cat([qe, 2 * qk * qe, -b_sq], dim=1)
+        memory = torch.cat([-mk.pow(2), mk, torch.ones_like(ms)], dim=1) * (ms / math.sqrt(ck))
+        pad = (-query.shape[1]) % 8
+        query = F.pad(query, (0, 0, 0, pad))
+        memory = F.pad(memory, (0, 0, 0, pad))
+
+        affinity = torch.softmax(query.transpose(1, 2) @ memory, dim=-1)  # B, HW, N
+        value = memory_value.flatten(start_dim=3).view(bs, num_objects * value_dim, -1)
+        readout = value @ affinity.transpose(1, 2)
+        return readout.view(bs, num_objects, value_dim, h, w)
+
+
+def _dense_aux_mask(self, logits, selector, seg_pass=False):
+    """QueryTransformer._get_aux_mask without the data-dependent torch.where.
+
+    Unblocks rows that would block every pixel, like the original, but with a dense
+    op so the ONNX graph has no NonZero (which forces a device-to-host sync per run).
+    """
+    prob = logits.sigmoid() if selector is None else logits.sigmoid() * selector
+    logits = aggregate(prob, dim=1)
+    foreground_mask = (logits[:, 1:] >= logits.max(dim=1, keepdim=True)[0]).flatten(start_dim=2)
+    aux_foreground_mask = (~foreground_mask).unsqueeze(2).unsqueeze(2).repeat(
+        1, 1, self.num_heads, self.num_queries // 2, 1).flatten(start_dim=0, end_dim=2)
+    aux_background_mask = foreground_mask.unsqueeze(2).unsqueeze(2).repeat(
+        1, 1, self.num_heads, self.num_queries // 2, 1).flatten(start_dim=0, end_dim=2)
+    aux_mask = torch.cat([aux_foreground_mask, aux_background_mask], dim=1)
+    return aux_mask & ~aux_mask.all(dim=-1, keepdim=True)
+
+
+def use_static_aux_mask():
+    QueryTransformer._get_aux_mask = _dense_aux_mask
+
+
 class MemoryReadoutWithUncertainty(torch.nn.Module):
-    def __init__(self, model, top_k: int | None = None):
+    def __init__(self, model, top_k: int | None = None, query_major: bool = False):
         super().__init__()
         self.model = model
-        self.read = MemoryReadout(top_k=top_k)
+        self.read = MemoryReadoutQueryMajor() if query_major else MemoryReadout(top_k=top_k)
 
     def forward(
         self,
@@ -145,10 +199,10 @@ class ReadMemoryAndPixelFusion(torch.nn.Module):
 
 
 class FullMemoryRead(torch.nn.Module):
-    def __init__(self, model, top_k: int | None = None):
+    def __init__(self, model, top_k: int | None = None, query_major: bool = False):
         super().__init__()
         self.model = model
-        self.read = MemoryReadoutWithUncertainty(model, top_k=top_k)
+        self.read = MemoryReadoutWithUncertainty(model, top_k=top_k, query_major=query_major)
 
     def forward(
         self,

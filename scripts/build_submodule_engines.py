@@ -4,7 +4,9 @@ from pathlib import Path
 import tensorrt as trt
 
 
-def build_engine(onnx_path: Path, engine_path: Path, workspace_gb: float) -> None:
+def build_engine(onnx_path: Path, engine_path: Path, workspace_gb: float, half_io: frozenset[str] = frozenset()) -> None:
+    """Builds an FP16 engine. Tensors named in `half_io` keep FP16 at the engine boundary,
+    which avoids FP32 reformat copies for large tensors passed between engines."""
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
@@ -15,6 +17,12 @@ def build_engine(onnx_path: Path, engine_path: Path, workspace_gb: float) -> Non
         for index in range(parser.num_errors):
             print(parser.get_error(index))
         raise RuntimeError(f"Failed to parse {onnx_path}")
+
+    for tensor in [network.get_input(i) for i in range(network.num_inputs)] + [
+        network.get_output(i) for i in range(network.num_outputs)
+    ]:
+        if tensor.name in half_io:
+            tensor.dtype = trt.float16
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gb * 1024**3))
