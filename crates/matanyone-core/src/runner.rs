@@ -1,529 +1,410 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::ffi::c_void;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::cuda::{memcpy_2d_async, memcpy_async, memset_async, CudaStream, MEMCPY_D2D, MEMCPY_D2H, MEMCPY_H2D};
-use crate::trt::{TrtEngine, TrtRuntime};
+use crate::cuda::{
+    memcpy_2d_async, memcpy_async, memset_async, CudaGraph, CudaStream, DevicePtr, MEMCPY_D2D, MEMCPY_D2H,
+    MEMCPY_H2D,
+};
+use crate::kernels::{init_cuda_kernels, launch_accumulate_f32};
+use crate::trt::{TrtEngine, TrtRuntime, DTYPE_FLOAT};
 
-const HW_BYTES: usize = 45 * 80 * std::mem::size_of::<f32>();
-const SLOT_PITCH: usize = 5 * HW_BYTES;
+/// Engine I/O tensor -> runner buffer. Tensors an engine lacks are skipped, so older
+/// engine sets (separate pixel_fusion, no shallow mask encoder) still bind.
+type Bindings = &'static [(&'static str, &'static str)];
 
-pub struct MatAnyoneRunner {
-    runtime: TrtRuntime,
-    encode: TrtEngine,
-    read: TrtEngine,
-    pixel_fusion: Option<TrtEngine>,
-    segment: TrtEngine,
-    encode_mask: TrtEngine,
-    stream: CudaStream,
-    buffers: HashMap<String, Buffer>,
-    mem_slot: i32,
+const ENCODE: Bindings = &[
+    ("input_0", "image"),
+    ("f16", "f16"),
+    ("f8", "f8"),
+    ("f4", "f4"),
+    ("f2", "f2"),
+    ("f1", "f1"),
+    ("pix_feat", "pix_feat"),
+    ("key", "key"),
+    ("shrinkage", "shrinkage"),
+    ("selection", "selection"),
+];
+const READ: Bindings = &[
+    ("input_0", "key"),
+    ("input_1", "selection"),
+    ("input_2", "memory_key"),
+    ("input_3", "memory_shrinkage"),
+    ("input_4", "memory_value"),
+    ("input_5", "last_pix_feat"),
+    ("input_6", "pix_feat"),
+    ("input_7", "last_mask"),
+    ("input_8", "last_msk_value"),
+    ("input_9", "sensory"),
+    ("input_10", "obj_memory"),
+    ("pixel_memory", "pixel_memory"),
+    ("memory_readout", "memory_readout"),
+];
+const PIXEL_FUSION: Bindings = &[
+    ("input_0", "pix_feat"),
+    ("input_1", "pixel_memory"),
+    ("input_2", "sensory"),
+    ("input_3", "last_mask"),
+    ("fused_pixel", "memory_readout"),
+];
+const SEGMENT: Bindings = &[
+    ("input_0", "f16"),
+    ("input_1", "f8"),
+    ("input_2", "f4"),
+    ("input_3", "f2"),
+    ("input_4", "f1"),
+    ("input_5", "memory_readout"),
+    ("input_6", "sensory"),
+    ("new_sensory", "new_sensory"),
+    ("alpha", "alpha"),
+];
+/// Deep update on memory frames: takes the segment's sensory and writes the updated one back.
+const ENCODE_MASK: Bindings = &[
+    ("input_0", "image"),
+    ("input_1", "pix_feat"),
+    ("input_2", "new_sensory"),
+    ("input_3", "alpha"),
+    ("mask_value", "last_msk_value"),
+    ("new_sensory", "sensory"),
+    ("object_summaries", "object_summaries"),
+];
+/// Every other frame refreshes only `last_msk_value` (InferenceCore.step, non-memory branch).
+const ENCODE_MASK_SHALLOW: Bindings = &[
+    ("input_0", "image"),
+    ("input_1", "pix_feat"),
+    ("input_2", "sensory"),
+    ("input_3", "alpha"),
+    ("mask_value", "last_msk_value"),
+];
+
+struct Stage {
+    engine: TrtEngine,
+    bindings: Bindings,
 }
 
-struct Buffer {
-    device: crate::cuda::DevicePtr,
+impl Stage {
+    fn load(runtime: &TrtRuntime, path: &Path, bindings: Bindings) -> Result<Self> {
+        Ok(Self { engine: TrtEngine::load(runtime, path)?, bindings })
+    }
+
+    fn load_optional(runtime: &TrtRuntime, path: &Path, bindings: Bindings) -> Result<Option<Self>> {
+        path.exists().then(|| Self::load(runtime, path, bindings)).transpose()
+    }
+
+    fn bound(&self) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        self.bindings.iter().copied().filter(|(tensor, _)| self.engine.has_tensor(tensor))
+    }
+}
+
+/// Memory bank geometry, derived from the engines' tensor sizes.
+/// Slot 0 holds the initial frame permanently; slots 1.. are a FIFO of memory frames.
+struct Bank {
+    slots: usize,
+    /// Bytes of one channel of one frame (H*W elements).
+    plane_bytes: usize,
+    key_channels: usize,
+    value_channels: usize,
+}
+
+/// A frame is split so callers can use the alpha before the memory work for the next
+/// frame finishes: `head` produces the alpha, a tail updates the state the next frame reads.
+struct FrameGraphs {
+    head: CudaGraph,
+    tail_normal: CudaGraph,
+    tail_update: CudaGraph,
+}
+
+pub struct MatAnyoneRunner {
+    // Field order is drop order: graphs and engines go before the buffers they reference,
+    // and the runtime goes last because engines must not outlive it.
+    graphs: Option<FrameGraphs>,
+    encode: Stage,
+    read: Stage,
+    pixel_fusion: Option<Stage>,
+    segment: Stage,
+    encode_mask: Stage,
+    encode_mask_shallow: Option<Stage>,
+    buffers: HashMap<&'static str, DevicePtr>,
+    bank: Bank,
+    next_slot: usize,
+    stream: CudaStream,
+    _runtime: TrtRuntime,
 }
 
 impl MatAnyoneRunner {
     pub fn new(engine_dir: &Path) -> Result<Self> {
+        init_cuda_kernels()?;
         let runtime = TrtRuntime::new()?;
-        let encode = TrtEngine::load(&runtime, &engine_dir.join("encode_image_fp16.engine"))?;
-        let read = TrtEngine::load(&runtime, &engine_dir.join("read_memory_fp16.engine"))?;
-        let pixel_fusion_path = engine_dir.join("pixel_fusion_fp16.engine");
-        let pixel_fusion = if pixel_fusion_path.exists() {
-            Some(TrtEngine::load(&runtime, &pixel_fusion_path)?)
-        } else {
-            None
-        };
-        let segment = TrtEngine::load(&runtime, &engine_dir.join("segment_fp16.engine"))?;
-        let encode_mask = TrtEngine::load(&runtime, &engine_dir.join("encode_mask_fp16.engine"))?;
-        let stream = CudaStream::new()?;
+        let path = |name: &str| engine_dir.join(name);
+        let encode = Stage::load(&runtime, &path("encode_image_fp16.engine"), ENCODE)?;
+        let read = Stage::load(&runtime, &path("read_memory_fp16.engine"), READ)?;
+        let pixel_fusion = Stage::load_optional(&runtime, &path("pixel_fusion_fp16.engine"), PIXEL_FUSION)?;
+        let segment = Stage::load(&runtime, &path("segment_fp16.engine"), SEGMENT)?;
+        let encode_mask = Stage::load(&runtime, &path("encode_mask_fp16.engine"), ENCODE_MASK)?;
+        let encode_mask_shallow =
+            Stage::load_optional(&runtime, &path("encode_mask_shallow_fp16.engine"), ENCODE_MASK_SHALLOW)?;
 
         let mut runner = Self {
-            runtime,
+            graphs: None,
             encode,
             read,
             pixel_fusion,
             segment,
             encode_mask,
-            stream,
+            encode_mask_shallow,
             buffers: HashMap::new(),
-            mem_slot: 1,
+            bank: Bank { slots: 0, plane_bytes: 0, key_channels: 0, value_channels: 0 },
+            next_slot: 1,
+            stream: CudaStream::new()?,
+            _runtime: runtime,
         };
-        runner.allocate_static_buffers()?;
-        runner.bind_engines()?;
+        runner.allocate_and_bind()?;
+        runner.bank = runner.bank_layout()?;
 
-        memset_async(
-            runner.buffer_ptr("memory_key")?,
-            0,
-            runner.buffer_bytes("memory_key")?,
-            runner.stream.raw(),
-            "memset memory_key",
-        )?;
-        memset_async(
-            runner.buffer_ptr("memory_shrinkage")?,
-            0,
-            runner.buffer_bytes("memory_shrinkage")?,
-            runner.stream.raw(),
-            "memset memory_shrinkage",
-        )?;
-        memset_async(
-            runner.buffer_ptr("memory_value")?,
-            0,
-            runner.buffer_bytes("memory_value")?,
-            runner.stream.raw(),
-            "memset memory_value",
-        )?;
-        memset_async(
-            runner.buffer_ptr("obj_memory")?,
-            0,
-            runner.buffer_bytes("obj_memory")?,
-            runner.stream.raw(),
-            "memset obj_memory",
-        )?;
+        // TensorRT finishes lazy initialisation on the first enqueue, which must not
+        // happen inside a capture. Run both paths once on the zeroed buffers, then capture.
+        runner.enqueue_head()?;
+        runner.enqueue_tail(false)?;
+        runner.enqueue_tail(true)?;
         runner.stream.synchronize()?;
+        runner.graphs = match runner.capture_graphs() {
+            Ok(graphs) => Some(graphs),
+            Err(err) => {
+                eprintln!("CUDA graph capture failed, enqueueing engines directly: {err:#}");
+                None
+            }
+        };
         Ok(runner)
+    }
+
+    fn stages(&self) -> impl Iterator<Item = &Stage> {
+        [Some(&self.encode), Some(&self.read), self.pixel_fusion.as_ref(), Some(&self.segment)]
+            .into_iter()
+            .chain([Some(&self.encode_mask), self.encode_mask_shallow.as_ref()])
+            .flatten()
+    }
+
+    /// Sizes every buffer from the engines that use it and binds all engine tensors.
+    fn allocate_and_bind(&mut self) -> Result<()> {
+        let mut specs: HashMap<&'static str, (usize, i32)> = HashMap::new();
+        for stage in self.stages() {
+            for (tensor, buffer) in stage.bound() {
+                let bytes = stage.engine.tensor_bytes(tensor)?;
+                let dtype = stage.engine.tensor_dtype(tensor)?;
+                let spec = specs.entry(buffer).or_insert((bytes, dtype));
+                if spec.1 != dtype {
+                    bail!("{buffer}: {tensor} in {} has dtype {dtype}, other engines use {}", stage.engine.path(), spec.1);
+                }
+                spec.0 = spec.0.max(bytes);
+            }
+        }
+        for name in ["image", "alpha", "obj_memory", "object_summaries"] {
+            if specs.get(name).is_some_and(|spec| spec.1 != DTYPE_FLOAT) {
+                bail!("{name} must be FP32");
+            }
+        }
+        for (name, (bytes, _)) in specs {
+            let buffer = DevicePtr::alloc(bytes, name)?;
+            memset_async(buffer.as_ptr(), 0, bytes, self.stream.raw(), name)?;
+            self.buffers.insert(name, buffer);
+        }
+        for stage in self.stages() {
+            for (tensor, buffer) in stage.bound() {
+                stage.engine.bind(tensor, self.buffers[buffer].as_ptr())?;
+            }
+        }
+        self.stream.synchronize()
+    }
+
+    fn bank_layout(&self) -> Result<Bank> {
+        let plane_bytes = self.bytes("shrinkage")?;
+        let bank = Bank {
+            slots: self.bytes("memory_shrinkage")? / plane_bytes,
+            plane_bytes,
+            key_channels: self.bytes("key")? / plane_bytes,
+            value_channels: self.bytes("last_msk_value")? / plane_bytes,
+        };
+        if bank.slots < 2
+            || self.bytes("memory_key")? != bank.slots * bank.key_channels * plane_bytes
+            || self.bytes("memory_value")? != bank.slots * bank.value_channels * plane_bytes
+        {
+            bail!("memory bank tensors do not match key/shrinkage/value sizes");
+        }
+        Ok(bank)
+    }
+
+    fn ptr(&self, name: &str) -> Result<*mut c_void> {
+        Ok(self.buffers.get(name).with_context(|| format!("missing buffer {name}"))?.as_ptr())
+    }
+
+    fn bytes(&self, name: &str) -> Result<usize> {
+        Ok(self.buffers.get(name).with_context(|| format!("missing buffer {name}"))?.bytes)
+    }
+
+    fn copy(&self, dst: &str, src: &str) -> Result<()> {
+        memcpy_async(self.ptr(dst)?, self.ptr(src)?, self.bytes(src)?, MEMCPY_D2D, self.stream.raw(), dst)
+    }
+
+    /// Image -> alpha.
+    fn enqueue_head(&self) -> Result<()> {
+        let stream = &self.stream;
+        self.encode.engine.enqueue(stream)?;
+        self.read.engine.enqueue(stream)?;
+        if let Some(pf) = &self.pixel_fusion {
+            pf.engine.enqueue(stream)?;
+        }
+        self.segment.engine.enqueue(stream)
+    }
+
+    /// State the next frame reads, except the memory bank write, which depends on the slot.
+    fn enqueue_tail(&self, memory_update: bool) -> Result<()> {
+        let stream = &self.stream;
+        if memory_update {
+            self.encode_mask.engine.enqueue(stream)?;
+            if self.buffers.contains_key("obj_memory") {
+                let n = (self.bytes("object_summaries")? / 4) as i32;
+                launch_accumulate_f32(
+                    self.ptr("obj_memory")? as *mut f32,
+                    self.ptr("object_summaries")? as *const f32,
+                    n,
+                    stream,
+                )?;
+            }
+        } else {
+            self.copy("sensory", "new_sensory")?;
+            if let Some(shallow) = &self.encode_mask_shallow {
+                shallow.engine.enqueue(stream)?;
+            }
+        }
+        self.copy("last_pix_feat", "pix_feat")?;
+        self.copy("last_mask", "alpha")
+    }
+
+    fn capture_graphs(&self) -> Result<FrameGraphs> {
+        Ok(FrameGraphs {
+            head: CudaGraph::capture(&self.stream, || self.enqueue_head())?,
+            tail_normal: CudaGraph::capture(&self.stream, || self.enqueue_tail(false))?,
+            tail_update: CudaGraph::capture(&self.stream, || self.enqueue_tail(true))?,
+        })
+    }
+
+    /// Copies the current key, shrinkage and mask value into memory slot `slot`.
+    fn write_bank_slot(&self, slot: usize) -> Result<()> {
+        let Bank { slots, plane_bytes, key_channels, value_channels } = self.bank;
+        let stream = self.stream.raw();
+        let plane = |name: &str| -> Result<*mut c_void> {
+            Ok(unsafe { (self.ptr(name)? as *mut u8).add(slot * plane_bytes) as *mut c_void })
+        };
+        memcpy_2d_async(
+            plane("memory_key")?,
+            slots * plane_bytes,
+            self.ptr("key")?,
+            plane_bytes,
+            plane_bytes,
+            key_channels,
+            MEMCPY_D2D,
+            stream,
+            "memory_key slot",
+        )?;
+        memcpy_async(plane("memory_shrinkage")?, self.ptr("shrinkage")?, plane_bytes, MEMCPY_D2D, stream, "memory_shrinkage slot")?;
+        memcpy_2d_async(
+            plane("memory_value")?,
+            slots * plane_bytes,
+            self.ptr("last_msk_value")?,
+            plane_bytes,
+            plane_bytes,
+            value_channels,
+            MEMCPY_D2D,
+            stream,
+            "memory_value slot",
+        )
     }
 
     pub fn stream(&self) -> &CudaStream {
         &self.stream
     }
 
-    fn allocate_buffer(&mut self, name: &str, dims: &[i64]) -> Result<()> {
-        if self.buffers.contains_key(name) {
-            return Ok(());
+    /// Planar RGB f32 model input; write the frame here before `initialize`/`process_frame`.
+    pub fn image_ptr(&self) -> *mut c_void {
+        self.buffers["image"].as_ptr()
+    }
+
+    /// Alpha f32 of the latest frame, valid until the next `process_frame`.
+    pub fn alpha_ptr(&self) -> *mut c_void {
+        self.buffers["alpha"].as_ptr()
+    }
+
+    pub fn upload_image(&self, rgb_nchw: &[f32]) -> Result<()> {
+        let bytes = self.bytes("image")?;
+        if rgb_nchw.len() * 4 != bytes {
+            bail!("image has {} floats, expected {}", rgb_nchw.len(), bytes / 4);
         }
-        let vol: i64 = dims.iter().product();
-        let bytes = vol as usize * std::mem::size_of::<f32>();
-        let device = crate::cuda::DevicePtr::alloc(bytes, name)?;
-        self.buffers.insert(name.to_string(), Buffer { device });
-        Ok(())
+        memcpy_async(self.image_ptr(), rgb_nchw.as_ptr() as *const _, bytes, MEMCPY_H2D, self.stream.raw(), "upload image")
     }
 
-    fn allocate_static_buffers(&mut self) -> Result<()> {
-        self.allocate_buffer("image", &[1, 3, 720, 1280])?;
-        self.allocate_buffer("last_mask", &[1, 1, 720, 1280])?;
-        self.allocate_buffer("alpha", &[1, 1, 720, 1280])?;
-        self.allocate_buffer("f16", &[1, 1024, 45, 80])?;
-        self.allocate_buffer("f8", &[1, 512, 90, 160])?;
-        self.allocate_buffer("f4", &[1, 256, 180, 320])?;
-        self.allocate_buffer("f2", &[1, 64, 360, 640])?;
-        self.allocate_buffer("f1", &[1, 3, 720, 1280])?;
-        self.allocate_buffer("pix_feat", &[1, 256, 45, 80])?;
-        self.allocate_buffer("last_pix_feat", &[1, 256, 45, 80])?;
-        self.allocate_buffer("key", &[1, 64, 45, 80])?;
-        self.allocate_buffer("shrinkage", &[1, 1, 45, 80])?;
-        self.allocate_buffer("selection", &[1, 64, 45, 80])?;
-        self.allocate_buffer("memory_key", &[1, 64, 5, 45, 80])?;
-        self.allocate_buffer("memory_shrinkage", &[1, 1, 5, 45, 80])?;
-        self.allocate_buffer("memory_value", &[1, 1, 256, 5, 45, 80])?;
-        self.allocate_buffer("last_msk_value", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("sensory", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("new_sensory", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("obj_memory", &[1, 1, 1, 16, 257])?;
-        self.allocate_buffer("pixel_memory", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("memory_readout", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("mask_value", &[1, 1, 256, 45, 80])?;
-        self.allocate_buffer("object_summaries", &[1, 1, 16, 257])?;
-        Ok(())
-    }
-
-    fn buffer_ptr(&self, name: &str) -> Result<*mut std::ffi::c_void> {
-        Ok(self
-            .buffers
-            .get(name)
-            .with_context(|| format!("missing buffer {name}"))?
-            .device
-            .as_ptr())
-    }
-
-    fn buffer_bytes(&self, name: &str) -> Result<usize> {
-        Ok(self
-            .buffers
-            .get(name)
-            .with_context(|| format!("missing buffer {name}"))?
-            .device
-            .bytes)
-    }
-
-    fn bind_engines(&self) -> Result<()> {
-        self.encode.bind("input_0", self.buffer_ptr("image")?)?;
-        self.encode.bind("f16", self.buffer_ptr("f16")?)?;
-        self.encode.bind("f8", self.buffer_ptr("f8")?)?;
-        self.encode.bind("f4", self.buffer_ptr("f4")?)?;
-        self.encode.bind("f2", self.buffer_ptr("f2")?)?;
-        self.encode.bind("f1", self.buffer_ptr("f1")?)?;
-        self.encode.bind("pix_feat", self.buffer_ptr("pix_feat")?)?;
-        self.encode.bind("key", self.buffer_ptr("key")?)?;
-        self.encode.bind("shrinkage", self.buffer_ptr("shrinkage")?)?;
-        self.encode.bind("selection", self.buffer_ptr("selection")?)?;
-
-        self.read.bind("input_0", self.buffer_ptr("key")?)?;
-        self.read.bind("input_1", self.buffer_ptr("selection")?)?;
-        self.read.bind("input_2", self.buffer_ptr("memory_key")?)?;
-        self.read.bind("input_3", self.buffer_ptr("memory_shrinkage")?)?;
-        self.read.bind("input_4", self.buffer_ptr("memory_value")?)?;
-        self.read.bind("input_5", self.buffer_ptr("last_pix_feat")?)?;
-        self.read.bind("input_6", self.buffer_ptr("pix_feat")?)?;
-        self.read.bind("input_7", self.buffer_ptr("last_mask")?)?;
-        self.read.bind("input_8", self.buffer_ptr("last_msk_value")?)?;
-        self.read.bind("input_9", self.buffer_ptr("sensory")?)?;
-        self.read.bind("input_10", self.buffer_ptr("obj_memory")?)?;
-        self.read.bind("pixel_memory", self.buffer_ptr("pixel_memory")?)?;
-        self.read.bind("memory_readout", self.buffer_ptr("memory_readout")?)?;
-
-        if let Some(ref pf) = self.pixel_fusion {
-            pf.bind("input_0", self.buffer_ptr("pix_feat")?)?;
-            pf.bind("input_1", self.buffer_ptr("pixel_memory")?)?;
-            pf.bind("input_2", self.buffer_ptr("sensory")?)?;
-            pf.bind("input_3", self.buffer_ptr("last_mask")?)?;
-            pf.bind("fused_pixel", self.buffer_ptr("memory_readout")?)?;
+    /// Starts tracking from the frame in the image buffer and its alpha mask.
+    pub fn initialize(&mut self, alpha_mask: &[f32]) -> Result<()> {
+        let alpha_bytes = self.bytes("alpha")?;
+        if alpha_mask.len() * 4 != alpha_bytes {
+            bail!("mask has {} floats, expected {}", alpha_mask.len(), alpha_bytes / 4);
         }
-
-        self.segment.bind("input_0", self.buffer_ptr("f16")?)?;
-        self.segment.bind("input_1", self.buffer_ptr("f8")?)?;
-        self.segment.bind("input_2", self.buffer_ptr("f4")?)?;
-        self.segment.bind("input_3", self.buffer_ptr("f2")?)?;
-        self.segment.bind("input_4", self.buffer_ptr("f1")?)?;
-        self.segment.bind("input_5", self.buffer_ptr("memory_readout")?)?;
-        self.segment.bind("input_6", self.buffer_ptr("sensory")?)?;
-        self.segment.bind("new_sensory", self.buffer_ptr("new_sensory")?)?;
-        self.segment.bind("alpha", self.buffer_ptr("alpha")?)?;
-
-        self.encode_mask.bind("input_0", self.buffer_ptr("image")?)?;
-        self.encode_mask.bind("input_1", self.buffer_ptr("pix_feat")?)?;
-        self.encode_mask.bind("input_2", self.buffer_ptr("new_sensory")?)?;
-        self.encode_mask.bind("input_3", self.buffer_ptr("alpha")?)?;
-        self.encode_mask.bind("mask_value", self.buffer_ptr("mask_value")?)?;
-        self.encode_mask.bind("new_sensory", self.buffer_ptr("sensory")?)?;
-        self.encode_mask
-            .bind("object_summaries", self.buffer_ptr("object_summaries")?)?;
-        Ok(())
-    }
-
-    fn copy_time_slot_from_contiguous(
-        &self,
-        dst: *mut u8,
-        slot: i32,
-        src: *const std::ffi::c_void,
-        channels: i32,
-        what: &str,
-    ) -> Result<()> {
-        memcpy_2d_async(
-            unsafe { dst.add(slot as usize * HW_BYTES) as *mut _ },
-            SLOT_PITCH,
-            src,
-            HW_BYTES,
-            HW_BYTES,
-            channels as usize,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            what,
-        )
-    }
-
-    fn copy_time_slot_to_slot(
-        &self,
-        base: *mut u8,
-        dst_slot: i32,
-        src_slot: i32,
-        channels: i32,
-        what: &str,
-    ) -> Result<()> {
-        memcpy_2d_async(
-            unsafe { base.add(dst_slot as usize * HW_BYTES) as *mut _ },
-            SLOT_PITCH,
-            unsafe { base.add(src_slot as usize * HW_BYTES) as *const _ },
-            SLOT_PITCH,
-            HW_BYTES,
-            channels as usize,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            what,
-        )
-    }
-
-    fn advance_memory_bank(&mut self, deep_update: bool) -> Result<()> {
-        let shrink_frame_bytes = 45 * 80 * std::mem::size_of::<f32>();
-        let value_frame_bytes = 256 * 45 * 80 * std::mem::size_of::<f32>();
-        let slot = if self.mem_slot < 5 { self.mem_slot } else { 4 };
-
-        let memory_key = self.buffer_ptr("memory_key")? as *mut u8;
-        let memory_shrink = self.buffer_ptr("memory_shrinkage")? as *mut u8;
-        let memory_value = self.buffer_ptr("memory_value")? as *mut u8;
-
-        if self.mem_slot >= 5 {
-            for dst in 1..4 {
-                let src = dst + 1;
-                self.copy_time_slot_to_slot(memory_key, dst, src, 64, "shift memory_key slot")?;
-                memcpy_async(
-                    unsafe { memory_shrink.add(dst as usize * shrink_frame_bytes) as *mut _ },
-                    unsafe { memory_shrink.add(src as usize * shrink_frame_bytes) as *const _ },
-                    shrink_frame_bytes,
-                    MEMCPY_D2D,
-                    self.stream.raw(),
-                    "shift memory_shrinkage slot",
-                )?;
-                self.copy_time_slot_to_slot(memory_value, dst, src, 256, "shift memory_value slot")?;
-            }
+        let stream = self.stream.raw();
+        memcpy_async(self.alpha_ptr(), alpha_mask.as_ptr() as *const _, alpha_bytes, MEMCPY_H2D, stream, "upload mask")?;
+        // Sensory memory starts at zero for a new object (initialize_sensory_if_needed).
+        for name in ["sensory", "new_sensory"] {
+            memset_async(self.ptr(name)?, 0, self.bytes(name)?, stream, name)?;
         }
-
-        self.copy_time_slot_from_contiguous(
-            memory_key,
-            slot,
-            self.buffer_ptr("key")?,
-            64,
-            "copy memory_key slot",
-        )?;
-        memcpy_async(
-            unsafe { memory_shrink.add(slot as usize * shrink_frame_bytes) as *mut _ },
-            self.buffer_ptr("shrinkage")?,
-            shrink_frame_bytes,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy memory_shrinkage slot",
-        )?;
-        self.copy_time_slot_from_contiguous(
-            memory_value,
-            slot,
-            self.buffer_ptr("mask_value")?,
-            256,
-            "copy memory_value slot",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("last_msk_value")?,
-            self.buffer_ptr("mask_value")?,
-            value_frame_bytes,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy last_msk_value",
-        )?;
-
-        if deep_update {
-            memcpy_async(
-                self.buffer_ptr("obj_memory")?,
-                self.buffer_ptr("object_summaries")?,
-                1 * 1 * 16 * 257 * std::mem::size_of::<f32>(),
-                MEMCPY_D2D,
-                self.stream.raw(),
-                "copy obj_memory",
-            )?;
-            memcpy_async(
-                self.buffer_ptr("last_pix_feat")?,
-                self.buffer_ptr("pix_feat")?,
-                value_frame_bytes,
-                MEMCPY_D2D,
-                self.stream.raw(),
-                "copy last_pix_feat",
-            )?;
-            memcpy_async(
-                self.buffer_ptr("last_mask")?,
-                self.buffer_ptr("alpha")?,
-                720 * 1280 * std::mem::size_of::<f32>(),
-                MEMCPY_D2D,
-                self.stream.raw(),
-                "copy last_mask",
-            )?;
+        self.encode.engine.enqueue(&self.stream)?;
+        self.encode_mask.engine.enqueue(&self.stream)?;
+        for slot in 0..self.bank.slots {
+            self.write_bank_slot(slot)?;
         }
-        self.mem_slot += 1;
-        Ok(())
-    }
-
-    fn seed_memory_bank(&mut self) -> Result<()> {
-        let shrink_frame_bytes = 45 * 80 * std::mem::size_of::<f32>();
-        let value_frame_bytes = 256 * 45 * 80 * std::mem::size_of::<f32>();
-        let memory_key = self.buffer_ptr("memory_key")? as *mut u8;
-        let memory_shrink = self.buffer_ptr("memory_shrinkage")? as *mut u8;
-        let memory_value = self.buffer_ptr("memory_value")? as *mut u8;
-
-        for slot in 0..5 {
-            self.copy_time_slot_from_contiguous(
-                memory_key,
-                slot,
-                self.buffer_ptr("key")?,
-                64,
-                "seed memory_key",
-            )?;
-            memcpy_async(
-                unsafe { memory_shrink.add(slot as usize * shrink_frame_bytes) as *mut _ },
-                self.buffer_ptr("shrinkage")?,
-                shrink_frame_bytes,
-                MEMCPY_D2D,
-                self.stream.raw(),
-                "seed memory_shrinkage",
-            )?;
-            self.copy_time_slot_from_contiguous(
-                memory_value,
-                slot,
-                self.buffer_ptr("mask_value")?,
-                256,
-                "seed memory_value",
-            )?;
+        if self.buffers.contains_key("obj_memory") {
+            self.copy("obj_memory", "object_summaries")?;
         }
-        memcpy_async(
-            self.buffer_ptr("obj_memory")?,
-            self.buffer_ptr("object_summaries")?,
-            1 * 1 * 16 * 257 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "seed obj_memory",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("last_pix_feat")?,
-            self.buffer_ptr("pix_feat")?,
-            value_frame_bytes,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "seed last_pix_feat",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("last_msk_value")?,
-            self.buffer_ptr("mask_value")?,
-            value_frame_bytes,
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "seed last_msk_value",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("last_mask")?,
-            self.buffer_ptr("alpha")?,
-            720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "seed last_mask",
-        )?;
-        self.mem_slot = 1;
-        Ok(())
-    }
-
-    pub fn initialize(&mut self, rgb_nchw: &[f32], alpha_mask_nchw: &[f32]) -> Result<()> {
-        memcpy_async(
-            self.buffer_ptr("image")?,
-            rgb_nchw.as_ptr() as *const _,
-            3 * 720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_H2D,
-            self.stream.raw(),
-            "copy initial image",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("alpha")?,
-            alpha_mask_nchw.as_ptr() as *const _,
-            720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_H2D,
-            self.stream.raw(),
-            "copy initial alpha",
-        )?;
-        self.encode.enqueue(&self.stream)?;
-        self.encode_mask.enqueue(&self.stream)?;
-        self.seed_memory_bank()?;
+        self.copy("last_pix_feat", "pix_feat")?;
+        self.copy("last_mask", "alpha")?;
+        self.next_slot = 1;
         self.stream.synchronize()
     }
 
-    pub fn initialize_device(
-        &mut self,
-        rgb_nchw_device: *const std::ffi::c_void,
-        alpha_mask_nchw_device: *const std::ffi::c_void,
-    ) -> Result<()> {
-        memcpy_async(
-            self.buffer_ptr("image")?,
-            rgb_nchw_device,
-            3 * 720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy initial image from device",
-        )?;
-        memcpy_async(
-            self.buffer_ptr("alpha")?,
-            alpha_mask_nchw_device,
-            720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy initial alpha from device",
-        )?;
-        self.encode.enqueue(&self.stream)?;
-        self.encode_mask.enqueue(&self.stream)?;
-        self.seed_memory_bank()?;
-        self.stream.synchronize()
-    }
-
-    pub fn process_frame_rgb(&mut self, rgb_nchw: &[f32], memory_update: bool) -> Result<()> {
-        memcpy_async(
-            self.buffer_ptr("image")?,
-            rgb_nchw.as_ptr() as *const _,
-            3 * 720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_H2D,
-            self.stream.raw(),
-            "copy frame image",
-        )?;
-        self.process_frame(memory_update)
-    }
-
-    pub fn process_frame_rgb_device(
-        &mut self,
-        rgb_nchw_device: *const std::ffi::c_void,
-        memory_update: bool,
-    ) -> Result<()> {
-        memcpy_async(
-            self.buffer_ptr("image")?,
-            rgb_nchw_device,
-            3 * 720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy frame image from device",
-        )?;
-        self.process_frame(memory_update)
-    }
-
-    pub fn copy_alpha_to_host(&self, alpha_nchw: &mut [f32]) -> Result<()> {
-        memcpy_async(
-            alpha_nchw.as_mut_ptr() as *mut _,
-            self.buffer_ptr("alpha")?,
-            720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2H,
-            self.stream.raw(),
-            "copy alpha to host",
-        )?;
-        self.stream.synchronize()
-    }
-
-    pub fn copy_alpha_to_device(&self, alpha_device: *mut std::ffi::c_void) -> Result<()> {
-        memcpy_async(
-            alpha_device,
-            self.buffer_ptr("alpha")?,
-            720 * 1280 * std::mem::size_of::<f32>(),
-            MEMCPY_D2D,
-            self.stream.raw(),
-            "copy alpha to device",
-        )
-    }
-
+    /// Segments the frame in the image buffer. `memory_update` also encodes it into memory.
     pub fn process_frame(&mut self, memory_update: bool) -> Result<()> {
-        self.encode.enqueue(&self.stream)?;
-        self.read.enqueue(&self.stream)?;
-        if let Some(ref pf) = self.pixel_fusion {
-            pf.enqueue(&self.stream)?;
+        self.segment_frame()?;
+        self.finish_frame(memory_update)
+    }
+
+    /// Enqueues the alpha computation for the frame in the image buffer. Work that reads
+    /// the alpha can be enqueued before `finish_frame`, which must follow before the next frame.
+    pub fn segment_frame(&mut self) -> Result<()> {
+        match &self.graphs {
+            Some(graphs) => graphs.head.launch(&self.stream),
+            None => self.enqueue_head(),
         }
-        self.segment.enqueue(&self.stream)?;
+    }
+
+    /// Enqueues the state updates the next frame depends on.
+    pub fn finish_frame(&mut self, memory_update: bool) -> Result<()> {
+        match &self.graphs {
+            Some(graphs) if memory_update => graphs.tail_update.launch(&self.stream)?,
+            Some(graphs) => graphs.tail_normal.launch(&self.stream)?,
+            None => self.enqueue_tail(memory_update)?,
+        }
         if memory_update {
-            self.encode_mask.enqueue(&self.stream)?;
-            self.advance_memory_bank(true)?;
+            self.write_bank_slot(self.next_slot)?;
+            self.next_slot = self.next_slot % (self.bank.slots - 1) + 1;
         }
         Ok(())
     }
 
-    pub fn alpha_device_ptr(&self) -> Result<*mut std::ffi::c_void> {
-        self.buffer_ptr("alpha")
+    pub fn copy_alpha_to_host(&self, alpha: &mut [f32]) -> Result<()> {
+        let bytes = self.bytes("alpha")?;
+        if alpha.len() * 4 != bytes {
+            bail!("alpha buffer has {} floats, expected {}", alpha.len(), bytes / 4);
+        }
+        memcpy_async(alpha.as_mut_ptr() as *mut _, self.alpha_ptr(), bytes, MEMCPY_D2H, self.stream.raw(), "download alpha")?;
+        self.stream.synchronize()
     }
-}
-
-// Silence unused runtime field warning — runtime must outlive engines
-impl Drop for MatAnyoneRunner {
-    fn drop(&mut self) {
-        let _ = &self.runtime;
-    }
-}
-
-pub fn default_engine_dir() -> PathBuf {
-    PathBuf::from("engines/faithful")
 }

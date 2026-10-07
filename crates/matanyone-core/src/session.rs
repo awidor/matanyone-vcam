@@ -3,38 +3,38 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use image::GenericImageView;
 
-use crate::cuda::{memcpy_async, DevicePtr, CudaStream, MEMCPY_D2H, MEMCPY_H2D};
-use crate::ffi;
-use crate::kernels::{init_cuda_kernels, launch_alpha_composite, launch_bgra_to_rgb_nchw};
+use crate::cuda::{memcpy_async, CudaEvent, DevicePtr, HostBuffer, MEMCPY_D2H, MEMCPY_H2D};
+use crate::kernels::{launch_bgr_to_rgb_nchw, launch_composite_bgr};
 use crate::runner::MatAnyoneRunner;
 
 pub const MODEL_W: usize = 1280;
 pub const MODEL_H: usize = 720;
 pub const FRAME_BYTES: usize = MODEL_W * MODEL_H * 3;
 
+/// Staging for an incoming packed-BGR frame: pinned host copy plus its device mirror.
+struct Upload {
+    host: HostBuffer,
+    device: DevicePtr,
+}
+
 pub struct Session {
     runner: MatAnyoneRunner,
-    d_rgb_nchw: DevicePtr,
-    d_alpha: DevicePtr,
-    d_bgra_in: Option<DevicePtr>,
-    d_bgra_out: DevicePtr,
+    upload: Option<Upload>,
+    d_bgr_out: DevicePtr,
+    h_bgr_out: HostBuffer,
+    readback_done: CudaEvent,
     initialized: bool,
     frame_index: u64,
 }
 
 impl Session {
     pub fn new(engine_dir: &Path) -> Result<Self> {
-        init_cuda_kernels().context("failed to initialize CUDA kernels")?;
-        let runner = MatAnyoneRunner::new(engine_dir)?;
-        let rgb_bytes = 3 * MODEL_H * MODEL_W * std::mem::size_of::<f32>();
-        let alpha_bytes = MODEL_H * MODEL_W * std::mem::size_of::<f32>();
-        let bgra_bytes = MODEL_W * MODEL_H * 4;
         Ok(Self {
-            runner,
-            d_rgb_nchw: DevicePtr::alloc(rgb_bytes, "d_rgb_nchw")?,
-            d_alpha: DevicePtr::alloc(alpha_bytes, "d_alpha")?,
-            d_bgra_in: None,
-            d_bgra_out: DevicePtr::alloc(bgra_bytes, "d_bgra_out")?,
+            runner: MatAnyoneRunner::new(engine_dir)?,
+            upload: None,
+            d_bgr_out: DevicePtr::alloc(FRAME_BYTES, "d_bgr_out")?,
+            h_bgr_out: HostBuffer::alloc(FRAME_BYTES, "h_bgr_out")?,
+            readback_done: CudaEvent::new()?,
             initialized: false,
             frame_index: 0,
         })
@@ -60,31 +60,16 @@ impl Session {
         mask_w: usize,
         mask_h: usize,
     ) -> Result<()> {
-        let stream_raw = self.runner.stream().raw();
-        self.upload_bgr_to_rgb(bgr, src_w, src_h, stream_raw)?;
-
+        self.upload_bgr(bgr, src_w, src_h)?;
         let mask_model = if mask_w == MODEL_W && mask_h == MODEL_H {
             mask_hw.to_vec()
         } else {
             resize_mask_nearest(mask_hw, mask_w, mask_h, MODEL_W, MODEL_H)
         };
-
-        let d_init_alpha = DevicePtr::alloc(MODEL_W * MODEL_H * 4, "init alpha")?;
-        memcpy_async(
-            d_init_alpha.as_ptr(),
-            mask_model.as_ptr() as *const _,
-            MODEL_W * MODEL_H * std::mem::size_of::<f32>(),
-            MEMCPY_H2D,
-            stream_raw,
-            "upload init alpha",
-        )?;
-        self.runner
-            .initialize_device(self.d_rgb_nchw.as_ptr(), d_init_alpha.as_ptr())?;
-        self.runner
-            .copy_alpha_to_device(self.d_alpha.as_ptr())?;
+        self.runner.initialize(&mask_model)?;
         self.initialized = true;
         self.frame_index = 1;
-        self.runner.stream().synchronize()
+        Ok(())
     }
 
     pub fn process_bgr(
@@ -101,27 +86,51 @@ impl Session {
         if !self.initialized {
             bail!("session not initialized");
         }
-        let stream_raw = self.runner.stream().raw();
-        self.upload_bgr_to_rgb(bgr_in, src_w, src_h, stream_raw)?;
-        self.runner
-            .process_frame_rgb_device(self.d_rgb_nchw.as_ptr(), memory_update)?;
-        self.runner
-            .copy_alpha_to_device(self.d_alpha.as_ptr())?;
+        if bgr_out.len() != dst_w as usize * dst_h as usize * 3 {
+            bail!("output buffer has {} bytes, expected {dst_w}x{dst_h}x3", bgr_out.len());
+        }
+        self.upload_bgr(bgr_in, src_w, src_h)?;
+        self.runner.segment_frame()?;
         self.frame_index += 1;
 
         let stream = self.runner.stream();
-        launch_alpha_composite(
-            self.d_rgb_nchw.as_ptr() as *const f32,
-            self.d_alpha.as_ptr() as *const f32,
-            bg_rgb.0,
-            bg_rgb.1,
-            bg_rgb.2,
-            self.d_bgra_out.as_ptr() as *mut u8,
-            MODEL_H as i32,
+        launch_composite_bgr(
+            self.runner.image_ptr() as *const f32,
+            self.runner.alpha_ptr() as *const f32,
+            bg_rgb,
+            self.d_bgr_out.as_ptr() as *mut u8,
             MODEL_W as i32,
+            MODEL_H as i32,
             stream,
         )?;
-        self.readback_bgr(bgr_out, dst_w, dst_h, stream)
+        memcpy_async(
+            self.h_bgr_out.as_mut_slice().as_mut_ptr() as *mut _,
+            self.d_bgr_out.as_ptr(),
+            FRAME_BYTES,
+            MEMCPY_D2H,
+            stream.raw(),
+            "readback bgr",
+        )?;
+        self.readback_done.record(stream)?;
+        // The memory update for the next frame runs on the GPU while the caller uses this one.
+        self.runner.finish_frame(memory_update)?;
+        self.readback_done.synchronize()?;
+
+        let model_bgr = self.h_bgr_out.as_slice();
+        if dst_w == MODEL_W as u32 && dst_h == MODEL_H as u32 {
+            bgr_out.copy_from_slice(model_bgr);
+            return Ok(());
+        }
+        for y in 0..dst_h {
+            let sy = ((y * MODEL_H as u32) / dst_h).min(MODEL_H as u32 - 1);
+            for x in 0..dst_w {
+                let sx = ((x * MODEL_W as u32) / dst_w).min(MODEL_W as u32 - 1);
+                let src_idx = (sy as usize * MODEL_W + sx as usize) * 3;
+                let dst_idx = (y as usize * dst_w as usize + x as usize) * 3;
+                bgr_out[dst_idx..dst_idx + 3].copy_from_slice(&model_bgr[src_idx..src_idx + 3]);
+            }
+        }
+        Ok(())
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -134,87 +143,39 @@ impl Session {
         self.frame_index
     }
 
-    fn upload_bgr_to_rgb(
-        &mut self,
-        bgr: &[u8],
-        src_w: u32,
-        src_h: u32,
-        stream_raw: ffi::cudaStream_t,
-    ) -> Result<()> {
-        let bgra_host = bgr_to_bgra(bgr, src_w as usize, src_h as usize);
-        let bytes = bgra_host.len();
-        if self.d_bgra_in.as_ref().map(|b| b.bytes).unwrap_or(0) < bytes {
-            self.d_bgra_in = Some(DevicePtr::alloc(bytes, "d_bgra_in")?);
+    /// Uploads a packed BGR frame of any size into the runner's model input (resized on GPU).
+    fn upload_bgr(&mut self, bgr: &[u8], src_w: u32, src_h: u32) -> Result<()> {
+        let bytes = src_w as usize * src_h as usize * 3;
+        if bgr.len() < bytes {
+            bail!("frame has {} bytes, expected {src_w}x{src_h}x3", bgr.len());
         }
-        let d_bgra = self.d_bgra_in.as_ref().unwrap();
+        if self.upload.as_ref().is_none_or(|u| u.host.len() < bytes) {
+            self.upload = Some(Upload {
+                host: HostBuffer::alloc(bytes, "bgr upload")?,
+                device: DevicePtr::alloc(bytes, "d_bgr_in")?,
+            });
+        }
+        let upload = self.upload.as_mut().unwrap();
+        upload.host.as_mut_slice()[..bytes].copy_from_slice(&bgr[..bytes]);
+        let stream = self.runner.stream();
         memcpy_async(
-            d_bgra.as_ptr(),
-            bgra_host.as_ptr() as *const _,
+            upload.device.as_ptr(),
+            upload.host.as_slice().as_ptr() as *const _,
             bytes,
             MEMCPY_H2D,
-            stream_raw,
-            "upload bgra",
+            stream.raw(),
+            "upload bgr",
         )?;
-        launch_bgra_to_rgb_nchw(
-            d_bgra.as_ptr() as *const u8,
+        launch_bgr_to_rgb_nchw(
+            upload.device.as_ptr() as *const u8,
             src_w as i32,
             src_h as i32,
-            (src_w * 4) as i32,
-            self.d_rgb_nchw.as_ptr() as *mut f32,
+            (src_w * 3) as i32,
+            self.runner.image_ptr() as *mut f32,
             MODEL_W as i32,
             MODEL_H as i32,
-            self.runner.stream(),
+            stream,
         )
-    }
-
-    fn readback_bgr(&self, bgr_out: &mut [u8], dst_w: u32, dst_h: u32, stream: &CudaStream) -> Result<()> {
-        let mut host_bgra = vec![0u8; MODEL_W * MODEL_H * 4];
-        memcpy_async(
-            host_bgra.as_mut_ptr() as *mut _,
-            self.d_bgra_out.as_ptr(),
-            host_bgra.len(),
-            MEMCPY_D2H,
-            stream.raw(),
-            "readback bgra",
-        )?;
-        stream.synchronize()?;
-
-        if dst_w == MODEL_W as u32 && dst_h == MODEL_H as u32 {
-            bgra_to_bgr(&host_bgra, bgr_out);
-            return Ok(());
-        }
-
-        let mut model_bgr = vec![0u8; MODEL_W * MODEL_H * 3];
-        bgra_to_bgr(&host_bgra, &mut model_bgr);
-        for y in 0..dst_h {
-            let sy = ((y * MODEL_H as u32) / dst_h).min(MODEL_H as u32 - 1);
-            for x in 0..dst_w {
-                let sx = ((x * MODEL_W as u32) / dst_w).min(MODEL_W as u32 - 1);
-                let src_idx = ((sy as usize * MODEL_W + sx as usize) * 3) as usize;
-                let dst_idx = ((y as usize * dst_w as usize + x as usize) * 3) as usize;
-                bgr_out[dst_idx..dst_idx + 3].copy_from_slice(&model_bgr[src_idx..src_idx + 3]);
-            }
-        }
-        Ok(())
-    }
-}
-
-fn bgr_to_bgra(bgr: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut bgra = vec![0u8; w * h * 4];
-    for i in 0..w * h {
-        bgra[i * 4] = bgr[i * 3];
-        bgra[i * 4 + 1] = bgr[i * 3 + 1];
-        bgra[i * 4 + 2] = bgr[i * 3 + 2];
-        bgra[i * 4 + 3] = 255;
-    }
-    bgra
-}
-
-fn bgra_to_bgr(bgra: &[u8], bgr: &mut [u8]) {
-    for i in 0..bgr.len() / 3 {
-        bgr[i * 3] = bgra[i * 4];
-        bgr[i * 3 + 1] = bgra[i * 4 + 1];
-        bgr[i * 3 + 2] = bgra[i * 4 + 2];
     }
 }
 
@@ -234,18 +195,16 @@ fn load_mask_png(path: &Path, dst_w: usize, dst_h: usize) -> Result<Vec<f32>> {
     let img = image::open(path).with_context(|| format!("failed to load mask image: {}", path.display()))?;
     let (w, h) = img.dimensions();
     let rgba = img.to_rgba8();
-    let mut alpha = vec![0.0f32; (w * h) as usize];
-    for y in 0..h {
-        for x in 0..w {
-            let px = rgba.get_pixel(x, y);
-            let a = if px[3] > 0 {
-                px[3] as f32 / 255.0
-            } else {
-                px[0].max(px[1]).max(px[2]) as f32 / 255.0
-            };
-            alpha[(y * w + x) as usize] = a;
-        }
-    }
+    // The matte is the alpha channel when the PNG has a real one; otherwise the gray level
+    // (max of RGB), as in grayscale masks from SAM or the MatAnyone2 samples.
+    let use_alpha = img.color().has_alpha() && rgba.pixels().any(|px| px[3] < 255);
+    let alpha: Vec<f32> = rgba
+        .pixels()
+        .map(|px| {
+            let value = if use_alpha { px[3] } else { px[0].max(px[1]).max(px[2]) };
+            value as f32 / 255.0
+        })
+        .collect();
     if w as usize == dst_w && h as usize == dst_h {
         return Ok(alpha);
     }

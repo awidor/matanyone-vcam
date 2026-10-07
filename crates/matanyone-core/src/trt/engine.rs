@@ -6,6 +6,18 @@ use anyhow::{Context, Result, bail};
 use crate::cuda::{path_to_c, CudaStream};
 use crate::ffi;
 
+pub const DTYPE_FLOAT: i32 = 0;
+
+fn dtype_size(dtype: i32) -> Result<usize> {
+    Ok(match dtype {
+        0 | 3 => 4,     // kFLOAT, kINT32
+        1 | 7 => 2,     // kHALF, kBF16
+        2 | 4 | 5 => 1, // kINT8, kBOOL, kUINT8
+        8 => 8,         // kINT64
+        _ => bail!("unsupported TensorRT data type {dtype}"),
+    })
+}
+
 pub struct TrtRuntime {
     ptr: *mut ffi::TrtRuntime,
 }
@@ -55,6 +67,28 @@ impl TrtEngine {
     pub fn has_tensor(&self, name: &str) -> bool {
         let cname = CString::new(name).unwrap();
         unsafe { ffi::matanyone_trt_has_tensor(self.ptr, cname.as_ptr()) != 0 }
+    }
+
+    /// TensorRT `DataType` code of an I/O tensor (0 = FP32, 1 = FP16, ...).
+    pub fn tensor_dtype(&self, name: &str) -> Result<i32> {
+        let cname = CString::new(name).context("tensor name")?;
+        match unsafe { ffi::matanyone_trt_tensor_dtype(self.ptr, cname.as_ptr()) } {
+            -1 => bail!("{name} is not an I/O tensor of {}", self.path),
+            dtype => Ok(dtype),
+        }
+    }
+
+    pub fn tensor_bytes(&self, name: &str) -> Result<usize> {
+        let cname = CString::new(name).context("tensor name")?;
+        let volume = unsafe { ffi::matanyone_trt_tensor_volume(self.ptr, cname.as_ptr()) };
+        if volume <= 0 {
+            bail!("{name} has no static shape in {}", self.path);
+        }
+        Ok(volume as usize * dtype_size(self.tensor_dtype(name)?)?)
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub fn bind(&self, name: &str, ptr: *mut std::ffi::c_void) -> Result<()> {

@@ -1,3 +1,3 @@
 mod engine;
 
-pub use engine::{BenchEngine, TrtEngine, TrtRuntime};
+pub use engine::{BenchEngine, TrtEngine, TrtRuntime, DTYPE_FLOAT};

@@ -3,6 +3,7 @@
 #include <NvInfer.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -15,8 +16,8 @@ namespace {
 class Logger final : public nvinfer1::ILogger {
 public:
     void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kWARNING) {
-            // stderr logging only on warnings/errors
+        if (severity <= Severity::kERROR) {
+            std::fprintf(stderr, "[TensorRT] %s\n", msg);
         }
     }
 };

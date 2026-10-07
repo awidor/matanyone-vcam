@@ -1,74 +1,105 @@
+use std::ffi::c_void;
 use std::ptr;
-use std::sync::Once;
+use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 
-use crate::cuda::{check_cu, CudaStream, MEMCPY_D2D, MEMCPY_D2H, MEMCPY_H2D, CUDA_SUCCESS};
+use crate::cuda::{check_cu, CudaStream};
 use crate::ffi;
 
-static INIT: Once = Once::new();
-static mut G_MODULE: ffi::CUmodule = ptr::null_mut();
-static mut G_BGRA_TO_RGB: ffi::CUfunction = ptr::null_mut();
-static mut G_ALPHA_COMPOSITE: ffi::CUfunction = ptr::null_mut();
-static mut G_ALPHA_OUTPUT: ffi::CUfunction = ptr::null_mut();
-static mut G_COPY_BGRA: ffi::CUfunction = ptr::null_mut();
+struct Kernels {
+    bgr_to_rgb_nchw: ffi::CUfunction,
+    composite_bgr: ffi::CUfunction,
+    accumulate_f32: ffi::CUfunction,
+}
+
+// CUfunction handles are process-global driver objects, valid from any thread.
+unsafe impl Send for Kernels {}
+unsafe impl Sync for Kernels {}
+
+static KERNELS: OnceLock<Result<Kernels, String>> = OnceLock::new();
 
 fn cubin_bytes() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/matanyone.cubin"))
 }
 
 pub fn init_cuda_kernels() -> Result<()> {
-    let mut err = Ok(());
-    INIT.call_once(|| {
-        if let Err(e) = init_cuda_kernels_inner() {
-            err = Err(e);
-        }
-    });
-    err
+    kernels().map(|_| ())
 }
 
-fn init_cuda_kernels_inner() -> Result<()> {
+fn kernels() -> Result<&'static Kernels> {
+    KERNELS
+        .get_or_init(|| load().map_err(|e| format!("{e:#}")))
+        .as_ref()
+        .map_err(|e| anyhow!("failed to initialize CUDA kernels: {e}"))
+}
+
+fn load() -> Result<Kernels> {
     unsafe {
-        if !G_MODULE.is_null() {
-            return Ok(());
-        }
         crate::cuda::check_cuda(ffi::cudaSetDevice(0), "cudaSetDevice")?;
         let _ = ffi::cudaFree(ptr::null_mut());
         check_cu(ffi::cuInit(0), "cuInit")?;
 
-        let data = cubin_bytes();
+        let mut module = ptr::null_mut();
         check_cu(
-            ffi::cuModuleLoadData(&mut G_MODULE, data.as_ptr() as *const _),
+            ffi::cuModuleLoadData(&mut module, cubin_bytes().as_ptr() as *const _),
             "cuModuleLoadData",
         )?;
-
-        let names = [
-            (
-                &mut G_BGRA_TO_RGB,
-                b"_Z23bgra_to_rgb_nchw_kernelPKhiiiPfii\0".as_ptr() as *const i8,
-            ),
-            (
-                &mut G_ALPHA_COMPOSITE,
-                b"_Z22alpha_composite_kernelPKfS0_fffPhii\0".as_ptr() as *const i8,
-            ),
-            (
-                &mut G_ALPHA_OUTPUT,
-                b"_Z19alpha_output_kernelPKfPhii\0".as_ptr() as *const i8,
-            ),
-            (
-                &mut G_COPY_BGRA,
-                b"_Z16copy_bgra_kernelPKhiPhiii\0".as_ptr() as *const i8,
-            ),
-        ];
-        for (func, name) in names {
-            check_cu(ffi::cuModuleGetFunction(func, G_MODULE, name), "cuModuleGetFunction")?;
-        }
+        let function = |name: &[u8]| -> Result<ffi::CUfunction> {
+            let mut func = ptr::null_mut();
+            check_cu(
+                ffi::cuModuleGetFunction(&mut func, module, name.as_ptr() as *const _),
+                "cuModuleGetFunction",
+            )?;
+            Ok(func)
+        };
+        Ok(Kernels {
+            bgr_to_rgb_nchw: function(b"bgr_to_rgb_nchw\0")?,
+            composite_bgr: function(b"composite_bgr\0")?,
+            accumulate_f32: function(b"accumulate_f32\0")?,
+        })
     }
-    Ok(())
 }
 
-pub fn launch_bgra_to_rgb_nchw(
-    bgra: *const u8,
+fn launch(
+    func: ffi::CUfunction,
+    grid: (u32, u32),
+    block: (u32, u32),
+    args: &mut [*mut c_void],
+    stream: &CudaStream,
+    what: &str,
+) -> Result<()> {
+    check_cu(
+        unsafe {
+            ffi::cuLaunchKernel(
+                func,
+                grid.0,
+                grid.1,
+                1,
+                block.0,
+                block.1,
+                1,
+                0,
+                stream.raw(),
+                args.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        },
+        what,
+    )
+}
+
+fn arg<T>(value: &T) -> *mut c_void {
+    value as *const T as *mut c_void
+}
+
+fn grid_2d(w: i32, h: i32) -> (u32, u32) {
+    (((w + 31) / 32) as u32, ((h + 7) / 8) as u32)
+}
+
+/// Packed BGR8 at any size -> planar RGB f32 at `dst_w`x`dst_h` (bilinear resize).
+pub fn launch_bgr_to_rgb_nchw(
+    bgr: *const u8,
     src_w: i32,
     src_h: i32,
     src_pitch: i32,
@@ -77,162 +108,48 @@ pub fn launch_bgra_to_rgb_nchw(
     dst_h: i32,
     stream: &CudaStream,
 ) -> Result<()> {
-    unsafe {
-        if G_BGRA_TO_RGB.is_null() {
-            return Ok(());
-        }
-        let mut args = [
-            &bgra as *const _ as *mut _,
-            &src_w as *const _ as *mut _,
-            &src_h as *const _ as *mut _,
-            &src_pitch as *const _ as *mut _,
-            &rgb_nchw as *const _ as *mut _,
-            &dst_w as *const _ as *mut _,
-            &dst_h as *const _ as *mut _,
-        ];
-        let grid_x = ((dst_w + 31) / 32) as u32;
-        let grid_y = ((dst_h + 15) / 16) as u32;
-        check_cu(
-            ffi::cuLaunchKernel(
-                G_BGRA_TO_RGB,
-                grid_x,
-                grid_y,
-                1,
-                32,
-                16,
-                1,
-                0,
-                stream.raw(),
-                args.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "launch_bgra_to_rgb_nchw",
-        )
-    }
+    let k = kernels()?;
+    launch(
+        k.bgr_to_rgb_nchw,
+        grid_2d(dst_w, dst_h),
+        (32, 8),
+        &mut [arg(&bgr), arg(&src_w), arg(&src_h), arg(&src_pitch), arg(&rgb_nchw), arg(&dst_w), arg(&dst_h)],
+        stream,
+        "launch bgr_to_rgb_nchw",
+    )
 }
 
-pub fn launch_alpha_composite(
-    src_rgb: *const f32,
+/// Planar RGB f32 + alpha -> packed BGR8 over a solid background (RGB in [0, 1]).
+pub fn launch_composite_bgr(
+    rgb_nchw: *const f32,
     alpha: *const f32,
-    bg_r: f32,
-    bg_g: f32,
-    bg_b: f32,
-    out_bgra: *mut u8,
-    h: i32,
+    bg_rgb: (f32, f32, f32),
+    out_bgr: *mut u8,
     w: i32,
+    h: i32,
     stream: &CudaStream,
 ) -> Result<()> {
-    unsafe {
-        if G_ALPHA_COMPOSITE.is_null() {
-            bail!("alpha composite kernel unavailable");
-        }
-        let mut args = [
-            &src_rgb as *const _ as *mut _,
-            &alpha as *const _ as *mut _,
-            &bg_r as *const _ as *mut _,
-            &bg_g as *const _ as *mut _,
-            &bg_b as *const _ as *mut _,
-            &out_bgra as *const _ as *mut _,
-            &h as *const _ as *mut _,
-            &w as *const _ as *mut _,
-        ];
-        let grid_x = ((w + 31) / 32) as u32;
-        let grid_y = ((h + 15) / 16) as u32;
-        check_cu(
-            ffi::cuLaunchKernel(
-                G_ALPHA_COMPOSITE,
-                grid_x,
-                grid_y,
-                1,
-                32,
-                16,
-                1,
-                0,
-                stream.raw(),
-                args.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "launch_alpha_composite",
-        )
-    }
+    let k = kernels()?;
+    let (r, g, b) = bg_rgb;
+    launch(
+        k.composite_bgr,
+        grid_2d(w, h),
+        (32, 8),
+        &mut [arg(&rgb_nchw), arg(&alpha), arg(&r), arg(&g), arg(&b), arg(&out_bgr), arg(&w), arg(&h)],
+        stream,
+        "launch composite_bgr",
+    )
 }
 
-pub fn launch_alpha_output(
-    alpha: *const f32,
-    out_alpha: *mut u8,
-    h: i32,
-    w: i32,
-    stream: &CudaStream,
-) -> Result<()> {
-    unsafe {
-        if G_ALPHA_OUTPUT.is_null() {
-            return Ok(());
-        }
-        let mut args = [
-            &alpha as *const _ as *mut _,
-            &out_alpha as *const _ as *mut _,
-            &h as *const _ as *mut _,
-            &w as *const _ as *mut _,
-        ];
-        let grid_x = ((w + 31) / 32) as u32;
-        let grid_y = ((h + 15) / 16) as u32;
-        check_cu(
-            ffi::cuLaunchKernel(
-                G_ALPHA_OUTPUT,
-                grid_x,
-                grid_y,
-                1,
-                32,
-                16,
-                1,
-                0,
-                stream.raw(),
-                args.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "launch_alpha_output",
-        )
-    }
-}
-
-pub fn launch_copy_bgra(
-    src: *const u8,
-    src_pitch: i32,
-    dst: *mut u8,
-    dst_pitch: i32,
-    h: i32,
-    w: i32,
-    stream: &CudaStream,
-) -> Result<()> {
-    unsafe {
-        if G_COPY_BGRA.is_null() {
-            return Ok(());
-        }
-        let mut args = [
-            &src as *const _ as *mut _,
-            &src_pitch as *const _ as *mut _,
-            &dst as *const _ as *mut _,
-            &dst_pitch as *const _ as *mut _,
-            &h as *const _ as *mut _,
-            &w as *const _ as *mut _,
-        ];
-        let grid_x = ((w + 31) / 32) as u32;
-        let grid_y = ((h + 15) / 16) as u32;
-        check_cu(
-            ffi::cuLaunchKernel(
-                G_COPY_BGRA,
-                grid_x,
-                grid_y,
-                1,
-                32,
-                16,
-                1,
-                0,
-                stream.raw(),
-                args.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "launch_copy_bgra",
-        )
-    }
+/// `dst += src` over `n` floats.
+pub fn launch_accumulate_f32(dst: *mut f32, src: *const f32, n: i32, stream: &CudaStream) -> Result<()> {
+    let k = kernels()?;
+    launch(
+        k.accumulate_f32,
+        (((n + 255) / 256) as u32, 1),
+        (256, 1),
+        &mut [arg(&dst), arg(&src), arg(&n)],
+        stream,
+        "launch accumulate_f32",
+    )
 }

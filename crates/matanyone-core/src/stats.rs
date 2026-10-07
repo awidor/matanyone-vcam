@@ -16,19 +16,3 @@ pub fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
     let frac = idx - lo as f64;
     values[lo] * (1.0 - frac) + values[hi] * frac
 }
-
-pub fn trt_element_size(dtype: i32) -> usize {
-    match dtype {
-        0 => 4,  // kFLOAT
-        1 => 2,  // kHALF
-        2 => 4,  // kINT8 - unused
-        3 => 4,  // kINT32
-        4 => 1,  // kBOOL
-        5 => 8,  // kINT64
-        _ => 4,
-    }
-}
-
-pub fn trt_volume(dims: &[i64]) -> i64 {
-    dims.iter().product()
-}

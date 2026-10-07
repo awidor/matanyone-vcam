@@ -72,6 +72,123 @@ impl Drop for DevicePtr {
     }
 }
 
+/// Page-locked host memory, so async copies to and from the device skip the driver's staging copy.
+pub struct HostBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl HostBuffer {
+    pub fn alloc(len: usize, name: &str) -> Result<Self> {
+        let mut ptr = ptr::null_mut();
+        check_cuda(
+            unsafe { ffi::cudaHostAlloc(&mut ptr, len.max(1), 0) },
+            &format!("cudaHostAlloc {name}"),
+        )?;
+        Ok(Self { ptr: ptr as *mut u8, len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaFreeHost(self.ptr as *mut _);
+        }
+    }
+}
+
+/// A completion marker in a stream. Waiting on it blocks the thread instead of spinning.
+pub struct CudaEvent(ffi::cudaEvent_t);
+
+impl CudaEvent {
+    pub fn new() -> Result<Self> {
+        const BLOCKING_SYNC: u32 = 0x01;
+        const DISABLE_TIMING: u32 = 0x02;
+        let mut event = ptr::null_mut();
+        check_cuda(
+            unsafe { ffi::cudaEventCreateWithFlags(&mut event, BLOCKING_SYNC | DISABLE_TIMING) },
+            "cudaEventCreateWithFlags",
+        )?;
+        Ok(Self(event))
+    }
+
+    pub fn record(&self, stream: &CudaStream) -> Result<()> {
+        check_cuda(unsafe { ffi::cudaEventRecord(self.0, stream.raw()) }, "cudaEventRecord")
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        check_cuda(unsafe { ffi::cudaEventSynchronize(self.0) }, "cudaEventSynchronize")
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaEventDestroy(self.0);
+        }
+    }
+}
+
+/// An instantiated CUDA graph captured from a stream.
+pub struct CudaGraph(ffi::cudaGraphExec_t);
+
+impl CudaGraph {
+    /// Captures everything `record` enqueues on `stream` without executing it.
+    pub fn capture(stream: &CudaStream, record: impl FnOnce() -> Result<()>) -> Result<Self> {
+        check_cuda(
+            unsafe {
+                ffi::cudaStreamBeginCapture(
+                    stream.raw(),
+                    ffi::cudaStreamCaptureMode_cudaStreamCaptureModeThreadLocal,
+                )
+            },
+            "cudaStreamBeginCapture",
+        )?;
+        let recorded = record();
+        let mut graph = ptr::null_mut();
+        let ended = check_cuda(
+            unsafe { ffi::cudaStreamEndCapture(stream.raw(), &mut graph) },
+            "cudaStreamEndCapture",
+        );
+        recorded?;
+        ended?;
+        let mut exec = ptr::null_mut();
+        let instantiated = check_cuda(
+            unsafe { ffi::cudaGraphInstantiate(&mut exec, graph, 0) },
+            "cudaGraphInstantiate",
+        );
+        unsafe {
+            let _ = ffi::cudaGraphDestroy(graph);
+        }
+        instantiated?;
+        Ok(Self(exec))
+    }
+
+    pub fn launch(&self, stream: &CudaStream) -> Result<()> {
+        check_cuda(unsafe { ffi::cudaGraphLaunch(self.0, stream.raw()) }, "cudaGraphLaunch")
+    }
+}
+
+impl Drop for CudaGraph {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaGraphExecDestroy(self.0);
+        }
+    }
+}
+
 pub struct CudaStream(pub ffi::cudaStream_t);
 
 impl CudaStream {
