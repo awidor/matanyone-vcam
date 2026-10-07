@@ -37,16 +37,10 @@ struct Args {
     no_vcam: bool,
 }
 
-#[derive(Clone)]
-struct SharedFrame {
-    rgb: Arc<Vec<u8>>,
-    width: u32,
-    height: u32,
-}
-
 struct PreviewState {
     texture: Option<egui::TextureHandle>,
-    latest: Option<SharedFrame>,
+    /// Newest worker frame (RGB, model size) not yet uploaded to `texture`.
+    pending: Option<Vec<u8>>,
     status: String,
     fps: f32,
     ms_per_frame: f32,
@@ -56,19 +50,23 @@ impl PreviewState {
     fn new() -> Self {
         Self {
             texture: None,
-            latest: None,
+            pending: None,
             status: "Idle".to_string(),
             fps: 0.0,
             ms_per_frame: 0.0,
         }
     }
 
-    fn set_frame(&mut self, rgb: Vec<u8>) {
-        self.latest = Some(SharedFrame {
-            rgb: Arc::new(rgb),
-            width: MODEL_W as u32,
-            height: MODEL_H as u32,
-        });
+    /// Uploads the pending frame, if any; the texture is reused across repaints otherwise.
+    fn upload_pending(&mut self, ctx: &egui::Context) {
+        let Some(rgb) = self.pending.take() else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgb([MODEL_W, MODEL_H], &rgb);
+        match self.texture.as_mut() {
+            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            None => self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR)),
+        }
     }
 }
 
@@ -285,7 +283,7 @@ impl MatAnyoneApp {
             return;
         };
         if let Some(frame) = poll.frame_slot.lock().take() {
-            self.preview.set_frame(frame);
+            self.preview.pending = Some(frame);
         }
         self.preview.status = poll.status_slot.lock().clone();
         let (fps, ms) = *poll.metrics_slot.lock();
@@ -406,42 +404,35 @@ impl eframe::App for MatAnyoneApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(frame) = self.preview.latest.clone() {
-                let image = egui::ColorImage::from_rgb([frame.width as usize, frame.height as usize], frame.rgb.as_ref());
-                if self.preview.texture.is_none() {
-                    self.preview.texture = Some(ctx.load_texture("preview", image.clone(), egui::TextureOptions::LINEAR));
-                }
-                if let Some(texture) = self.preview.texture.as_mut() {
-                    texture.set(image, egui::TextureOptions::LINEAR);
-                }
-                if let Some(texture) = self.preview.texture.as_ref() {
-                    let response = ui.add(
-                        egui::Image::from_texture(texture)
-                            .fit_to_exact_size(egui::vec2(960.0, 540.0))
-                            .sense(egui::Sense::click()),
-                    );
-
-                if self.settings.sam_mode && response.clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let rect = response.rect;
-                        let x = ((pos.x - rect.min.x) / rect.width() * MODEL_W as f32) as i32;
-                        let y = ((pos.y - rect.min.y) / rect.height() * MODEL_H as f32) as i32;
-                        let point = [
-                            x.clamp(0, MODEL_W as i32 - 1),
-                            y.clamp(0, MODEL_H as i32 - 1),
-                        ];
-                        if response.secondary_clicked() {
-                            self.settings.sam_bg_points.push(point);
-                        } else {
-                            self.settings.sam_fg_points.push(point);
-                        }
-                    }
-                }
-                }
-            } else {
+            self.preview.upload_pending(ctx);
+            let Some(texture) = self.preview.texture.as_ref() else {
                 ui.centered_and_justified(|ui| {
                     ui.label("Preview will appear after processing starts.");
                 });
+                return;
+            };
+            let response = ui.add(
+                egui::Image::from_texture(texture)
+                    .fit_to_exact_size(egui::vec2(960.0, 540.0))
+                    .sense(egui::Sense::click()),
+            );
+
+            // `clicked()` is the primary button only; right clicks add background points.
+            if self.settings.sam_mode && (response.clicked() || response.secondary_clicked()) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let rect = response.rect;
+                    let x = ((pos.x - rect.min.x) / rect.width() * MODEL_W as f32) as i32;
+                    let y = ((pos.y - rect.min.y) / rect.height() * MODEL_H as f32) as i32;
+                    let point = [
+                        x.clamp(0, MODEL_W as i32 - 1),
+                        y.clamp(0, MODEL_H as i32 - 1),
+                    ];
+                    if response.secondary_clicked() {
+                        self.settings.sam_bg_points.push(point);
+                    } else {
+                        self.settings.sam_fg_points.push(point);
+                    }
+                }
             }
         });
 
