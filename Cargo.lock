@@ -2769,6 +2769,7 @@ dependencies = [
  "tempfile",
  "tray-icon",
  "virtualcam",
+ "windows 0.58.0",
 ]
 
 [[package]]

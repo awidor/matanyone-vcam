@@ -4,14 +4,78 @@ use anyhow::{Context, Result, bail};
 use image::GenericImageView;
 
 use crate::cuda::{memcpy_async, CudaEvent, DevicePtr, HostBuffer, MEMCPY_D2H, MEMCPY_H2D};
-use crate::kernels::{launch_bgr_to_rgb_nchw, launch_composite_bgr};
+use crate::kernels::{launch_bgr_to_rgb_nchw, launch_composite_bgr, launch_nv12_to_rgb_nchw};
 use crate::runner::MatAnyoneRunner;
 
 pub const MODEL_W: usize = 1280;
 pub const MODEL_H: usize = 720;
 pub const FRAME_BYTES: usize = MODEL_W * MODEL_H * 3;
 
-/// Staging for an incoming packed-BGR frame: pinned host copy plus its device mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Packed 8-bit BGR.
+    Bgr,
+    /// 8-bit Y plane followed by interleaved UV at half resolution, BT.709 limited range.
+    Nv12,
+}
+
+/// An input frame at any size; the session converts and resizes it on the GPU.
+#[derive(Clone, Copy)]
+pub struct Frame<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+}
+
+impl<'a> Frame<'a> {
+    pub fn bgr(data: &'a [u8], width: u32, height: u32) -> Self {
+        Self { data, width, height, format: PixelFormat::Bgr }
+    }
+
+    pub fn nv12(data: &'a [u8], width: u32, height: u32) -> Self {
+        Self { data, width, height, format: PixelFormat::Nv12 }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        let pixels = self.width as usize * self.height as usize;
+        match self.format {
+            PixelFormat::Bgr => pixels * 3,
+            PixelFormat::Nv12 => pixels * 3 / 2,
+        }
+    }
+
+    /// Packed BGR at `dst_w`x`dst_h` (nearest neighbour) on the CPU, for one-off uses
+    /// such as SAM prompts and the first preview.
+    pub fn to_bgr(&self, dst_w: usize, dst_h: usize) -> Vec<u8> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut out = vec![0u8; dst_w * dst_h * 3];
+        for y in 0..dst_h {
+            let sy = (y * h / dst_h).min(h - 1);
+            for x in 0..dst_w {
+                let sx = (x * w / dst_w).min(w - 1);
+                let px = &mut out[(y * dst_w + x) * 3..][..3];
+                match self.format {
+                    PixelFormat::Bgr => px.copy_from_slice(&self.data[(sy * w + sx) * 3..][..3]),
+                    PixelFormat::Nv12 => {
+                        let luma = self.data[sy * w + sx] as f32;
+                        let uv = &self.data[w * h + (sy / 2) * w + (sx / 2) * 2..][..2];
+                        let yn = (luma - 16.0) / 219.0;
+                        let un = (uv[0] as f32 - 128.0) / 224.0;
+                        let vn = (uv[1] as f32 - 128.0) / 224.0;
+                        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        px[0] = to_u8(yn + 1.8556 * un);
+                        px[1] = to_u8(yn - 0.1873 * un - 0.4681 * vn);
+                        px[2] = to_u8(yn + 1.5748 * vn);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Staging for an incoming frame: pinned host copy plus its device mirror.
 struct Upload {
     host: HostBuffer,
     device: DevicePtr,
@@ -40,27 +104,13 @@ impl Session {
         })
     }
 
-    pub fn init_from_mask_file(
-        &mut self,
-        bgr: &[u8],
-        src_w: u32,
-        src_h: u32,
-        mask_png: &Path,
-    ) -> Result<()> {
+    pub fn init_from_mask_file(&mut self, frame: Frame, mask_png: &Path) -> Result<()> {
         let mask = load_mask_png(mask_png, MODEL_W, MODEL_H)?;
-        self.init_from_mask(bgr, src_w, src_h, &mask, MODEL_W, MODEL_H)
+        self.init_from_mask(frame, &mask, MODEL_W, MODEL_H)
     }
 
-    pub fn init_from_mask(
-        &mut self,
-        bgr: &[u8],
-        src_w: u32,
-        src_h: u32,
-        mask_hw: &[f32],
-        mask_w: usize,
-        mask_h: usize,
-    ) -> Result<()> {
-        self.upload_bgr(bgr, src_w, src_h)?;
+    pub fn init_from_mask(&mut self, frame: Frame, mask_hw: &[f32], mask_w: usize, mask_h: usize) -> Result<()> {
+        self.upload(frame)?;
         let mask_model = if mask_w == MODEL_W && mask_h == MODEL_H {
             mask_hw.to_vec()
         } else {
@@ -72,11 +122,10 @@ impl Session {
         Ok(())
     }
 
-    pub fn process_bgr(
+    /// Mattes `frame` and writes the composite as packed BGR at `dst_w`x`dst_h`.
+    pub fn process(
         &mut self,
-        bgr_in: &[u8],
-        src_w: u32,
-        src_h: u32,
+        frame: Frame,
         bgr_out: &mut [u8],
         dst_w: u32,
         dst_h: u32,
@@ -89,7 +138,7 @@ impl Session {
         if bgr_out.len() != dst_w as usize * dst_h as usize * 3 {
             bail!("output buffer has {} bytes, expected {dst_w}x{dst_h}x3", bgr_out.len());
         }
-        self.upload_bgr(bgr_in, src_w, src_h)?;
+        self.upload(frame)?;
         self.runner.segment_frame()?;
         self.frame_index += 1;
 
@@ -143,20 +192,23 @@ impl Session {
         self.frame_index
     }
 
-    /// Uploads a packed BGR frame of any size into the runner's model input (resized on GPU).
-    fn upload_bgr(&mut self, bgr: &[u8], src_w: u32, src_h: u32) -> Result<()> {
-        let bytes = src_w as usize * src_h as usize * 3;
-        if bgr.len() < bytes {
-            bail!("frame has {} bytes, expected {src_w}x{src_h}x3", bgr.len());
+    /// Uploads a frame of any size into the runner's model input (converted and resized on GPU).
+    fn upload(&mut self, frame: Frame) -> Result<()> {
+        let bytes = frame.byte_len();
+        if frame.data.len() < bytes {
+            bail!("{:?} frame has {} bytes, expected {bytes} for {}x{}", frame.format, frame.data.len(), frame.width, frame.height);
+        }
+        if frame.format == PixelFormat::Nv12 && (frame.width % 2 != 0 || frame.height % 2 != 0) {
+            bail!("NV12 frame size {}x{} is not even", frame.width, frame.height);
         }
         if self.upload.as_ref().is_none_or(|u| u.host.len() < bytes) {
             self.upload = Some(Upload {
-                host: HostBuffer::alloc(bytes, "bgr upload")?,
-                device: DevicePtr::alloc(bytes, "d_bgr_in")?,
+                host: HostBuffer::alloc(bytes, "frame upload")?,
+                device: DevicePtr::alloc(bytes, "d_frame_in")?,
             });
         }
         let upload = self.upload.as_mut().unwrap();
-        upload.host.as_mut_slice()[..bytes].copy_from_slice(&bgr[..bytes]);
+        upload.host.as_mut_slice()[..bytes].copy_from_slice(&frame.data[..bytes]);
         let stream = self.runner.stream();
         memcpy_async(
             upload.device.as_ptr(),
@@ -164,18 +216,14 @@ impl Session {
             bytes,
             MEMCPY_H2D,
             stream.raw(),
-            "upload bgr",
+            "upload frame",
         )?;
-        launch_bgr_to_rgb_nchw(
-            upload.device.as_ptr() as *const u8,
-            src_w as i32,
-            src_h as i32,
-            (src_w * 3) as i32,
-            self.runner.image_ptr() as *mut f32,
-            MODEL_W as i32,
-            MODEL_H as i32,
-            stream,
-        )
+        let (src, w, h) = (upload.device.as_ptr() as *const u8, frame.width as i32, frame.height as i32);
+        let rgb = self.runner.image_ptr() as *mut f32;
+        match frame.format {
+            PixelFormat::Bgr => launch_bgr_to_rgb_nchw(src, w, h, w * 3, rgb, MODEL_W as i32, MODEL_H as i32, stream),
+            PixelFormat::Nv12 => launch_nv12_to_rgb_nchw(src, w, h, rgb, MODEL_W as i32, MODEL_H as i32, stream),
+        }
     }
 }
 

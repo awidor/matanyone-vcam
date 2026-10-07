@@ -173,11 +173,13 @@ Core smoke test (no camera):
 
 
 
-The Rust app uses the [`virtualcam`](https://crates.io/crates/virtualcam) crate with the UnityCapture backend when available. This does **not** require OBS Studio.
+The output is chosen per run in `app/src/vcam.rs` so it never feeds the input:
 
+- Unity Video Capture when it is registered. `app/src/unity_capture.rs` implements its shared-memory protocol (`Source/shared.inl`): RGBA rows bottom-up, linear resize to whatever the consuming app asks for. The `virtualcam` crate's Unity backend uses different object names and a different header, so frames never reached the filter.
+- Otherwise OBS Virtual Camera via the `virtualcam` crate's OBS queue writer, when OBS is neither the input nor publishing its own virtual camera.
+- Otherwise preview only, with the reason in the window.
 
-
-Unity Video Capture must be registered on the system (typically via the UnityCapture installer). If UnityCapture is unavailable, the crate falls back to its default backend.
+OBS Virtual Camera as an input is read from OBS's shared-memory queue (`OBSVirtualCamVideo`, NV12) in `app/src/obs_vcam.rs` and converted on the GPU, so it needs neither DirectShow nor ffmpeg. The reader lets go of the queue when OBS stops, because OBS cannot restart its virtual camera while another process holds it.
 
 
 

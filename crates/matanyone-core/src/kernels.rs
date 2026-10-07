@@ -9,6 +9,7 @@ use crate::ffi;
 
 struct Kernels {
     bgr_to_rgb_nchw: ffi::CUfunction,
+    nv12_to_rgb_nchw: ffi::CUfunction,
     composite_bgr: ffi::CUfunction,
     accumulate_f32: ffi::CUfunction,
 }
@@ -55,6 +56,7 @@ fn load() -> Result<Kernels> {
         };
         Ok(Kernels {
             bgr_to_rgb_nchw: function(b"bgr_to_rgb_nchw\0")?,
+            nv12_to_rgb_nchw: function(b"nv12_to_rgb_nchw\0")?,
             composite_bgr: function(b"composite_bgr\0")?,
             accumulate_f32: function(b"accumulate_f32\0")?,
         })
@@ -116,6 +118,27 @@ pub fn launch_bgr_to_rgb_nchw(
         &mut [arg(&bgr), arg(&src_w), arg(&src_h), arg(&src_pitch), arg(&rgb_nchw), arg(&dst_w), arg(&dst_h)],
         stream,
         "launch bgr_to_rgb_nchw",
+    )
+}
+
+/// Packed NV12 (BT.709 limited range) at any even size -> planar RGB f32 at `dst_w`x`dst_h`.
+pub fn launch_nv12_to_rgb_nchw(
+    nv12: *const u8,
+    src_w: i32,
+    src_h: i32,
+    rgb_nchw: *mut f32,
+    dst_w: i32,
+    dst_h: i32,
+    stream: &CudaStream,
+) -> Result<()> {
+    let k = kernels()?;
+    launch(
+        k.nv12_to_rgb_nchw,
+        grid_2d(dst_w, dst_h),
+        (32, 8),
+        &mut [arg(&nv12), arg(&src_w), arg(&src_h), arg(&rgb_nchw), arg(&dst_w), arg(&dst_h)],
+        stream,
+        "launch nv12_to_rgb_nchw",
     )
 }
 

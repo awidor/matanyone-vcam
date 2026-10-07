@@ -44,6 +44,52 @@ extern "C" __global__ void bgr_to_rgb_nchw(
     }
 }
 
+__device__ inline float bilinear_u8(const uint8_t* plane, int pitch, int step, int w, int h, float x, float y)
+{
+    x = fminf(fmaxf(x, 0.0f), w - 1.0f);
+    y = fminf(fmaxf(y, 0.0f), h - 1.0f);
+    const int x0 = static_cast<int>(x);
+    const int y0 = static_cast<int>(y);
+    const int x1 = min(x0 + 1, w - 1);
+    const int y1 = min(y0 + 1, h - 1);
+    const float fx = x - x0;
+    const float fy = y - y0;
+    const uint8_t* r0 = plane + static_cast<size_t>(y0) * pitch;
+    const uint8_t* r1 = plane + static_cast<size_t>(y1) * pitch;
+    const float top = r0[x0 * step] + fx * (r0[x1 * step] - r0[x0 * step]);
+    const float bottom = r1[x0 * step] + fx * (r1[x1 * step] - r1[x0 * step]);
+    return top + fy * (bottom - top);
+}
+
+// Packed NV12 (any even size) -> planar RGB float in [0, 1] at the model size.
+// BT.709 limited range, the OBS default; bilinear luma and chroma.
+extern "C" __global__ void nv12_to_rgb_nchw(
+    const uint8_t* __restrict__ nv12, int src_w, int src_h,
+    float* __restrict__ rgb, int dst_w, int dst_h)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dst_w || y >= dst_h) return;
+
+    const float sx = (x + 0.5f) * src_w / dst_w - 0.5f;
+    const float sy = (y + 0.5f) * src_h / dst_h - 0.5f;
+    const uint8_t* uv = nv12 + static_cast<size_t>(src_w) * src_h;
+    const float luma = bilinear_u8(nv12, src_w, 1, src_w, src_h, sx, sy);
+    const float cx = (sx + 0.5f) * 0.5f - 0.5f;
+    const float cy = (sy + 0.5f) * 0.5f - 0.5f;
+    const float u = bilinear_u8(uv, src_w, 2, src_w / 2, src_h / 2, cx, cy);
+    const float v = bilinear_u8(uv + 1, src_w, 2, src_w / 2, src_h / 2, cx, cy);
+
+    const float yn = (luma - 16.0f) * (1.0f / 219.0f);
+    const float un = (u - 128.0f) * (1.0f / 224.0f);
+    const float vn = (v - 128.0f) * (1.0f / 224.0f);
+    const size_t plane = static_cast<size_t>(dst_w) * dst_h;
+    const size_t idx = static_cast<size_t>(y) * dst_w + x;
+    rgb[idx] = fminf(fmaxf(yn + 1.5748f * vn, 0.0f), 1.0f);
+    rgb[plane + idx] = fminf(fmaxf(yn - 0.1873f * un - 0.4681f * vn, 0.0f), 1.0f);
+    rgb[2 * plane + idx] = fminf(fmaxf(yn + 1.8556f * un, 0.0f), 1.0f);
+}
+
 // Planar RGB float + alpha -> packed BGR8 composited over a solid colour.
 extern "C" __global__ void composite_bgr(
     const float* __restrict__ rgb, const float* __restrict__ alpha,

@@ -15,3 +15,4 @@ parking_lot = "0.12"
 tray-icon = "0.19"
 matanyone-core = { path = "../crates/matanyone-core", default-features = true }
 virtualcam = "0.1"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading"] }

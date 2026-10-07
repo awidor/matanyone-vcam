@@ -3,7 +3,7 @@
 Real-time background matting for a webcam, published as a virtual camera that any video app can use. A Rust app on Windows runs [MatAnyone2](https://github.com/pq-yang/MatAnyone2) through TensorRT at 720p.
 
 - **Pick the subject once.** Click the first frame with SAM 3.1 (left click: subject, right click: background), load a mask PNG, or start from a centre mask. MatAnyone2 tracks it from there.
-- **Use it like a webcam.** Output goes to a virtual camera (Unity Video Capture) that other apps can select. OBS isn't required.
+- **Use it like a webcam.** Output goes to a virtual camera (Unity Video Capture, or OBS Virtual Camera) that other apps can select. OBS Virtual Camera also works as the input.
 - **Preview it live.** An egui window shows the composite while it runs.
 
 There are no prebuilt downloads. TensorRT engines are specific to a GPU and TensorRT version, so you export them on the machine that runs the app.
@@ -27,7 +27,7 @@ That leaves about half of the 33 ms frame budget of a 30 fps camera. MatAnyone2 
 - Rust, Visual Studio C++ build tools, and LLVM (libclang, for `bindgen`).
 - CUDA 13.x and TensorRT 10.16.1.11 for CUDA 13 (`TensorRT-10.16.1.11.Windows.amd64.cuda-13.2.zip`). Engines only load in the TensorRT version that built them, so this must match the `tensorrt` Python package exactly. Set `CUDA_ROOT` and `TENSORRT_ROOT` if they aren't at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1` and `C:\Tools\TensorRT-10.16.1.11`.
 - [uv](https://docs.astral.sh/uv/) for exporting the engines (Python 3.10, PyTorch with CUDA 12.8).
-- [Unity Video Capture](https://github.com/schellingb/UnityCapture), registered as a camera device.
+- A virtual camera for the output: [Unity Video Capture](https://github.com/schellingb/UnityCapture) registered as a camera device, or OBS Studio's virtual camera when OBS isn't your input.
 
 ## Build
 
@@ -51,7 +51,12 @@ Build the app. This copies `matanyone-vcam.exe` and the TensorRT and CUDA runtim
 .\matanyone-vcam.exe
 ```
 
-Choose the input camera, pick the subject, and press **Start**. In your video app, select **Unity Video Capture** as the camera.
+Choose the input camera, pick the subject, and press **Start**.
+
+- **OBS Virtual Camera** is listed whenever OBS Studio is installed and is read straight from OBS, without ffmpeg. If OBS hasn't started its virtual camera yet, the app waits for it. Other DirectShow-only cameras still need ffmpeg on `PATH` or in `FFMPEG_DIR`.
+- The output is picked automatically and shown in the window. It goes to **Unity Video Capture** when that's installed, otherwise to **OBS Virtual Camera** when OBS is neither the input nor publishing its own virtual camera. With OBS as the input and no Unity Video Capture, the app runs preview-only. `--no-vcam` forces preview-only.
+
+In your video app, select the camera shown as the output.
 
 SAM 3.1 click selection runs in a Python worker. Install [facebookresearch/sam3](https://github.com/facebookresearch/sam3) into a Python environment and point `SAM31_PYTHON` at its interpreter. `SAM31_CHECKPOINT` selects a local checkpoint. Without SAM, use a mask PNG or the centre mask.
 

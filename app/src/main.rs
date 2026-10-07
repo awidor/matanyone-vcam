@@ -1,7 +1,9 @@
 mod capture;
 mod core;
+mod obs_vcam;
 mod paths;
 mod sam;
+mod unity_capture;
 mod vcam;
 
 use std::path::PathBuf;
@@ -33,6 +35,7 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     camera: usize,
 
+    /// Preview only; never publish to a virtual camera.
     #[arg(long)]
     no_vcam: bool,
 }
@@ -108,7 +111,7 @@ struct MatAnyoneApp {
 
 impl MatAnyoneApp {
     fn new(args: Args, _install_root: PathBuf, repo_root: PathBuf, engine_dir: PathBuf) -> Result<Self> {
-        let cameras = CameraCapture::list_devices().unwrap_or_default();
+        let cameras = CameraCapture::list_devices();
         let menu = Menu::with_items(&[
             &MenuItem::with_id("show", "Show MatAnyone", true, None),
             &MenuItem::with_id("quit", "Quit", true, None),
@@ -155,12 +158,11 @@ impl MatAnyoneApp {
             return;
         };
         let enable_vcam = self.settings.enable_vcam;
-        if enable_vcam && camera_entry.is_obs_virtual_camera() {
-            self.preview.status = "OBS Virtual Camera cannot be both input and output. \
-                Disable virtual-camera output or choose a different input."
-                .to_string();
-            return;
-        }
+        let waiting_status = if camera_entry.is_obs_virtual_camera() {
+            "Waiting for OBS Virtual Camera: click Start Virtual Camera in OBS".to_string()
+        } else {
+            format!("Waiting for frames from {}", camera_entry.name)
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -198,15 +200,22 @@ impl MatAnyoneApp {
                 let mut rgb_preview = vec![0u8; FRAME_BYTES];
                 let mut initialized = false;
                 let mut frame_index = 0u64;
+                // The output adapts to the input, so OBS Virtual Camera can be either one.
                 let mut vcam = if enable_vcam {
-                    Some(VirtualCamera::open()?)
+                    match VirtualCamera::open_for_input(&camera_name) {
+                        Ok(vcam) => {
+                            *vcam_name_slot.lock() = vcam.device_name().to_string();
+                            Some(vcam)
+                        }
+                        Err(reason) => {
+                            *vcam_name_slot.lock() = reason;
+                            None
+                        }
+                    }
                 } else {
+                    *vcam_name_slot.lock() = "off (--no-vcam)".to_string();
                     None
                 };
-
-                if let Some(vcam) = vcam.as_ref() {
-                    *vcam_name_slot.lock() = vcam.device_name().to_string();
-                }
 
                 let bg_norm = (
                     bg[2] as f32 / 255.0,
@@ -216,25 +225,29 @@ impl MatAnyoneApp {
 
                 while !stop.load(Ordering::SeqCst) {
                     let start = Instant::now();
-                    let (bgr, w, h) = camera.capture_bgr()?;
+                    let Some(frame) = camera.next_frame()? else {
+                        *status_slot.lock() = waiting_status.clone();
+                        continue;
+                    };
 
                     if !initialized {
+                        let first_bgr = frame.to_bgr(MODEL_W, MODEL_H);
                         if !sam_fg.is_empty() {
-                            let mask_file = sam::mask_from_sam_clicks(bgr, &sam_fg, &sam_bg, &repo_root)?;
-                            session.init_from_mask_file(bgr, w, h, &mask_file)?;
+                            let mask_file = sam::mask_from_sam_clicks(&first_bgr, &sam_fg, &sam_bg, &repo_root)?;
+                            session.init_from_mask_file(frame, &mask_file)?;
                         } else if let Some(mask) = mask_path.as_ref() {
-                            session.init_from_mask_file(bgr, w, h, mask)?;
+                            session.init_from_mask_file(frame, mask)?;
                         } else if use_center_mask {
-                            session.init_center_mask(bgr, w, h)?;
+                            session.init_center_mask(frame)?;
                         } else {
                             anyhow::bail!("no mask configured");
                         }
                         initialized = true;
                         frame_index = 1;
-                        bgr_to_rgb(bgr, &mut rgb_preview);
+                        bgr_to_rgb(&first_bgr, &mut rgb_preview);
                         *frame_slot.lock() = Some(rgb_preview.clone());
                     } else {
-                        session.process_bgr(bgr, w, h, &mut out, bg_norm)?;
+                        session.process(frame, &mut out, bg_norm)?;
                         bgr_to_rgb(&out, &mut rgb_preview);
                         *frame_slot.lock() = Some(rgb_preview.clone());
                         if let Some(vcam) = vcam.as_mut() {
@@ -247,10 +260,7 @@ impl MatAnyoneApp {
                     let ms = elapsed.as_secs_f32() * 1000.0;
                     let fps = if ms > 0.0 { 1000.0 / ms } else { 0.0 };
                     *metrics_slot.lock() = (fps, ms);
-                    *status_slot.lock() = format!(
-                        "Running frame={frame_index} camera={camera_name} vcam={}",
-                        if enable_vcam { "on" } else { "off" }
-                    );
+                    *status_slot.lock() = format!("Running frame={frame_index} camera={camera_name}");
 
                     let target = Duration::from_secs_f64(1.0 / 30.0);
                     if elapsed < target {
@@ -325,7 +335,7 @@ impl eframe::App for MatAnyoneApp {
             });
             ui.label(&self.preview.status);
             if !self.vcam_device.is_empty() {
-                ui.label(format!("Virtual camera device: {}", self.vcam_device));
+                ui.label(format!("Virtual camera output: {}", self.vcam_device));
             }
             ui.label(format!(
                 "Timing: {:.1} ms/frame ({:.1} fps)",
@@ -370,7 +380,7 @@ impl eframe::App for MatAnyoneApp {
                     }
                 });
             if ui.button("Refresh cameras").clicked() {
-                self.cameras = CameraCapture::list_devices().unwrap_or_default();
+                self.cameras = CameraCapture::list_devices();
                 if self.settings.camera_index >= self.cameras.len() && !self.cameras.is_empty() {
                     self.settings.camera_index = 0;
                 }
@@ -378,14 +388,10 @@ impl eframe::App for MatAnyoneApp {
             if self.cameras.is_empty() {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "No cameras found. Start OBS Virtual Camera or connect a webcam, then refresh.",
+                    "No cameras found. Connect a webcam or install OBS Studio, then refresh.",
                 );
             }
-            ui.label("DirectShow devices (e.g. OBS Virtual Camera) require ffmpeg on PATH or FFMPEG_DIR.");
-            ui.checkbox(
-                &mut self.settings.enable_vcam,
-                "Publish to virtual camera (turn off when using OBS Virtual Camera as input)",
-            );
+            ui.label("Output goes to Unity Video Capture, or to OBS Virtual Camera when OBS isn't the input.");
 
             ui.separator();
             ui.checkbox(&mut self.settings.sam_mode, "SAM3.1 click mode (first frame)");

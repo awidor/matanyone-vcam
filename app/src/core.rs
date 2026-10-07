@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub use matanyone_core::{MODEL_H, MODEL_W, FRAME_BYTES, center_mask};
+pub use matanyone_core::{Frame, MODEL_H, MODEL_W, FRAME_BYTES, center_mask};
 
 pub struct Session {
     inner: matanyone_core::Session,
@@ -17,39 +17,23 @@ impl Session {
         })
     }
 
-    pub fn init_from_mask_file(&mut self, bgr: &[u8], src_w: u32, src_h: u32, mask_path: &Path) -> Result<()> {
-        self.inner.init_from_mask_file(bgr, src_w, src_h, mask_path)?;
+    pub fn init_from_mask_file(&mut self, frame: Frame, mask_path: &Path) -> Result<()> {
+        self.inner.init_from_mask_file(frame, mask_path)?;
         self.frame_index = 1;
         Ok(())
     }
 
-    pub fn init_center_mask(&mut self, bgr: &[u8], src_w: u32, src_h: u32) -> Result<()> {
+    pub fn init_center_mask(&mut self, frame: Frame) -> Result<()> {
         let mask = center_mask(MODEL_W, MODEL_H);
-        self.inner
-            .init_from_mask(bgr, src_w, src_h, &mask, MODEL_W, MODEL_H)?;
+        self.inner.init_from_mask(frame, &mask, MODEL_W, MODEL_H)?;
         self.frame_index = 1;
         Ok(())
     }
 
-    pub fn process_bgr(
-        &mut self,
-        bgr_in: &[u8],
-        src_w: u32,
-        src_h: u32,
-        bgr_out: &mut [u8],
-        bg: (f32, f32, f32),
-    ) -> Result<()> {
+    pub fn process(&mut self, frame: Frame, bgr_out: &mut [u8], bg: (f32, f32, f32)) -> Result<()> {
         let memory_update = self.frame_index > 0 && self.frame_index % 5 == 0;
-        self.inner.process_bgr(
-            bgr_in,
-            src_w,
-            src_h,
-            bgr_out,
-            MODEL_W as u32,
-            MODEL_H as u32,
-            bg,
-            memory_update,
-        )?;
+        self.inner
+            .process(frame, bgr_out, MODEL_W as u32, MODEL_H as u32, bg, memory_update)?;
         self.frame_index += 1;
         Ok(())
     }

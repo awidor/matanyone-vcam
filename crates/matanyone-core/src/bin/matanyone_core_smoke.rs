@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use matanyone_core::{center_mask, make_synthetic_bgr, mean, percentile, Session, FRAME_BYTES, MODEL_H, MODEL_W};
+use matanyone_core::{center_mask, make_synthetic_bgr, mean, percentile, Frame, Session, FRAME_BYTES, MODEL_H, MODEL_W};
 
 const BG: (f32, f32, f32) = (0.0, 180.0 / 255.0, 80.0 / 255.0);
 
@@ -51,7 +51,7 @@ fn frame_path(dir: &Path, index: usize) -> Option<PathBuf> {
 fn run_synthetic(session: &mut Session, output: &Path, max_frames: usize, interval: Duration) -> Result<()> {
     let (w, h) = (MODEL_W as u32, MODEL_H as u32);
     let first = make_synthetic_bgr(MODEL_W, MODEL_H, 0);
-    session.init_from_mask(&first, w, h, &center_mask(MODEL_W, MODEL_H), MODEL_W, MODEL_H)?;
+    session.init_from_mask(Frame::bgr(&first, w, h), &center_mask(MODEL_W, MODEL_H), MODEL_W, MODEL_H)?;
 
     // A few distinct frames, reused, so frame generation stays out of the timing.
     let inputs: Vec<Vec<u8>> = (1..=8).map(|i| make_synthetic_bgr(MODEL_W, MODEL_H, i)).collect();
@@ -63,7 +63,7 @@ fn run_synthetic(session: &mut Session, output: &Path, max_frames: usize, interv
         next_frame += interval;
         let start = Instant::now();
         session
-            .process_bgr(&inputs[i % inputs.len()], w, h, &mut out, w, h, BG, i % 5 == 0)
+            .process(Frame::bgr(&inputs[i % inputs.len()], w, h), &mut out, w, h, BG, i % 5 == 0)
             .with_context(|| format!("process failed frame {i}"))?;
         timings.push(start.elapsed().as_secs_f64() * 1000.0);
     }
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
 
     let first_path = frame_path(&input_dir, 0).context("missing first frame 00000.png/.jpg")?;
     let (first, w, h) = read_bgr(&first_path)?;
-    session.init_from_mask_file(&first, w, h, &mask_path)?;
+    session.init_from_mask_file(Frame::bgr(&first, w, h), &mask_path)?;
 
     let mut out = vec![0u8; FRAME_BYTES];
     for i in 0..max_frames {
@@ -108,7 +108,7 @@ fn main() -> Result<()> {
         };
         let (bgr, w, h) = read_bgr(&path)?;
         session
-            .process_bgr(&bgr, w, h, &mut out, MODEL_W as u32, MODEL_H as u32, BG, i > 0 && i % 5 == 0)
+            .process(Frame::bgr(&bgr, w, h), &mut out, MODEL_W as u32, MODEL_H as u32, BG, i > 0 && i % 5 == 0)
             .with_context(|| format!("process failed frame {i}"))?;
     }
     write_png(&output, &out)?;

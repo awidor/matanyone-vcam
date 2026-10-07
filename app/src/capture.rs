@@ -1,14 +1,19 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 
-use crate::core::{MODEL_H, MODEL_W, resize_bgr_nearest};
+use crate::core::{Frame, MODEL_H, MODEL_W, resize_bgr_nearest};
+use crate::obs_vcam::{self, ObsVirtualCamReader};
 use crate::paths;
+
+/// How long `next_frame` waits for a source that has not started publishing yet.
+const FRAME_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct CameraEntry {
@@ -19,11 +24,13 @@ pub struct CameraEntry {
 #[derive(Clone)]
 enum CameraSource {
     MediaFoundation { index: u32 },
+    ObsVirtualCamera,
     DirectShow { name: String },
 }
 
 enum CameraBackend {
     Native(NativeCapture),
+    Obs(ObsVirtualCamReader),
     FfmpegDshow(FfmpegDshowCapture),
 }
 
@@ -43,16 +50,29 @@ struct FfmpegDshowCapture {
 }
 
 impl CameraEntry {
+    /// True while the source waits for another app (OBS) rather than hardware.
     pub fn is_obs_virtual_camera(&self) -> bool {
-        self.name.to_ascii_lowercase().contains("obs virtual camera")
+        matches!(self.source, CameraSource::ObsVirtualCamera)
     }
 }
 
 impl CameraCapture {
-    pub fn list_devices() -> Result<Vec<CameraEntry>> {
-        let mut entries = list_media_foundation_devices()?;
+    /// Media Foundation cameras, OBS Virtual Camera whenever it is installed (read natively,
+    /// OBS does not have to be running yet), then other DirectShow cameras when ffmpeg exists.
+    pub fn list_devices() -> Vec<CameraEntry> {
+        let mut entries: Vec<CameraEntry> = list_media_foundation_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !device_names_match(&entry.name, obs_vcam::DEVICE_NAME))
+            .collect();
+        if obs_vcam::is_installed() {
+            entries.push(CameraEntry {
+                name: obs_vcam::DEVICE_NAME.to_string(),
+                source: CameraSource::ObsVirtualCamera,
+            });
+        }
         if let Some(ffmpeg) = paths::find_ffmpeg() {
-            for name in list_dshow_devices(&ffmpeg)? {
+            for name in list_dshow_devices(&ffmpeg).unwrap_or_default() {
                 if entries.iter().any(|entry| device_names_match(&entry.name, &name)) {
                     continue;
                 }
@@ -62,7 +82,7 @@ impl CameraCapture {
                 });
             }
         }
-        Ok(entries)
+        entries
     }
 
     pub fn open(entry: &CameraEntry) -> Result<Self> {
@@ -70,9 +90,10 @@ impl CameraCapture {
             CameraSource::MediaFoundation { index } => {
                 CameraBackend::Native(NativeCapture::open(*index)?)
             }
+            CameraSource::ObsVirtualCamera => CameraBackend::Obs(ObsVirtualCamReader::new()),
             CameraSource::DirectShow { name } => {
                 let ffmpeg = paths::find_ffmpeg().context(
-                    "ffmpeg is required for DirectShow cameras such as OBS Virtual Camera; \
+                    "ffmpeg is required for DirectShow-only cameras; \
                      set FFMPEG_DIR or install ffmpeg on PATH",
                 )?;
                 CameraBackend::FfmpegDshow(FfmpegDshowCapture::open(&ffmpeg, name)?)
@@ -81,11 +102,20 @@ impl CameraCapture {
         Ok(Self { backend })
     }
 
-    pub fn capture_bgr(&mut self) -> Result<(&[u8], u32, u32)> {
-        match &mut self.backend {
-            CameraBackend::Native(native) => native.capture_bgr(),
-            CameraBackend::FfmpegDshow(dshow) => dshow.capture_bgr(),
-        }
+    /// The next frame, or `None` if the source is not publishing yet (OBS Virtual Camera
+    /// not started); call again to keep waiting.
+    pub fn next_frame(&mut self) -> Result<Option<Frame<'_>>> {
+        Ok(match &mut self.backend {
+            CameraBackend::Native(native) => {
+                let (bgr, w, h) = native.capture_bgr()?;
+                Some(Frame::bgr(bgr, w, h))
+            }
+            CameraBackend::Obs(obs) => obs.next_frame(FRAME_WAIT),
+            CameraBackend::FfmpegDshow(dshow) => {
+                let (bgr, w, h) = dshow.capture_bgr()?;
+                Some(Frame::bgr(bgr, w, h))
+            }
+        })
     }
 }
 
@@ -141,7 +171,7 @@ fn list_dshow_devices(ffmpeg: &Path) -> Result<Vec<String>> {
     Ok(devices)
 }
 
-fn device_names_match(left: &str, right: &str) -> bool {
+pub fn device_names_match(left: &str, right: &str) -> bool {
     let left = normalize_device_name(left);
     let right = normalize_device_name(right);
     left == right || left.contains(&right) || right.contains(&left)
