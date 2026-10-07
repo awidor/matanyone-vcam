@@ -32,7 +32,7 @@ Standalone real-time matting app with virtual camera output (no OBS dependency):
 
 ```text
 
-matanyone-obs/
+matanyone-vcam/
 
   matanyone-vcam.exe      # main app (copied here by build.ps1)
   nvinfer_*.dll, cudart64_*.dll  # TensorRT/CUDA runtime (copied by build.ps1)
