@@ -195,7 +195,7 @@ Click-to-mask uses `Sam31Predictor` in `matanyone-core`. Default build enables `
 
 - Latency: `scripts/check_bench_parity.ps1` (±2% vs `docs/benchmark_baselines.json`)
 
-- Alpha: `scripts/measure_runner_accuracy.py` (mean abs diff ≤ 0.005 vs Python TRT pipeline)
+- Alpha: `scripts/measure_fidelity.py` (runner alpha vs the original PyTorch `InferenceCore` on the same frames; 0.00019 mean abs diff on the 96-frame sample)
 
 - SAM: `scripts/measure_sam_parity.py` (when TRT SAM export completes)
 

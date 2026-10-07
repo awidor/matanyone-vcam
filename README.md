@@ -12,34 +12,30 @@ There are no prebuilt downloads. TensorRT engines are specific to a GPU and Tens
 
 RTX 3080, 1280×720, FP16 engines ([`docs/benchmark_baselines.json`](docs/benchmark_baselines.json)):
 
-| Frame | Mean | p99 |
+| Measurement | Mean | p99 |
 | :--- | ---: | ---: |
-| Mixed frames, Rust runner | 21.1 ms | 23.2 ms |
-| Normal frame | 21.3 ms | 24.7 ms |
-| Memory-update frame | 23.3 ms | 27.0 ms |
+| Frame latency at 30 fps, BGR in to composited BGR out | 15.1 ms | 17.2 ms |
+| Mixed frames, Rust runner | 16.3 ms | 17.8 ms |
+| Normal frame, engines only | 17.6 ms | 18.8 ms |
+| Memory-update frame, engines only | 18.1 ms | 19.7 ms |
 
-Inference fits inside the 33 ms frame budget of a 30 fps camera. MatAnyone2 is split into six TensorRT engines. The biggest win came from replacing top-k memory attention with full softmax: memory reads went from 10.2 ms to 5.3 ms, and alpha changed by a mean of 0.00013. See [`docs/profile_optimization.md`](docs/profile_optimization.md).
+That leaves about half of the 33 ms frame budget of a 30 fps camera. MatAnyone2 runs as five TensorRT engines, replayed as CUDA graphs. The memory read was the slowest part until it was rewritten as plain attention (one similarity GEMM and a softmax along the contiguous axis), which took it from 10.7 ms to 4.6 ms. Alpha differs from the original PyTorch model by a mean of 0.0002 on the sample clips (`scripts/measure_fidelity.py`). See [`docs/profile_optimization.md`](docs/profile_optimization.md).
 
 ## Requirements
 
 - Windows with an NVIDIA RTX 30 or 40 series GPU. The bundled CUDA kernels are compiled for `sm_86`, which runs on both.
 - Rust, Visual Studio C++ build tools, and LLVM (libclang, for `bindgen`).
-- CUDA 13.1 and TensorRT 10.16. Set `CUDA_ROOT` and `TENSORRT_ROOT` if they aren't at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1` and `C:\Tools\TensorRT-10.16.1.11`.
+- CUDA 13.x and TensorRT 10.16.1.11 for CUDA 13 (`TensorRT-10.16.1.11.Windows.amd64.cuda-13.2.zip`). Engines only load in the TensorRT version that built them, so this must match the `tensorrt` Python package exactly. Set `CUDA_ROOT` and `TENSORRT_ROOT` if they aren't at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1` and `C:\Tools\TensorRT-10.16.1.11`.
 - [uv](https://docs.astral.sh/uv/) for exporting the engines (Python 3.10, PyTorch with CUDA 12.8).
 - [Unity Video Capture](https://github.com/schellingb/UnityCapture), registered as a camera device.
 
 ## Build
 
-Export the engines. The first step downloads the MatAnyone2 checkpoint.
+Export the engines. This downloads the MatAnyone2 checkpoint and builds the five engines the app loads into `engines/faithful/` (about 10 minutes).
 
 ```powershell
 uv sync
-uv run python scripts/export_submodules.py
-uv run python scripts/build_submodule_engines.py
-uv run python scripts/profile_variants.py
-uv run python scripts/profile_full_read.py
-uv run python scripts/profile_mask_shallow.py
-uv run python scripts/prepare_faithful_engines.py   # -> engines/faithful/
+uv run python scripts/build_faithful_engines.py
 ```
 
 Build the app. This copies `matanyone-vcam.exe` and the TensorRT and CUDA runtime DLLs to the repository root.
@@ -62,10 +58,13 @@ SAM 3.1 click selection runs in a Python worker. Install [facebookresearch/sam3]
 ## Development
 
 ```powershell
-.\bin\matanyone_core_smoke.exe --synthetic engines\faithful   # core test, no camera
+.\bin\matanyone_core_smoke.exe --synthetic --frames=200 --interval-ms=33 engines\faithful   # frame latency at 30 fps, no camera
 .\bin\matanyone_runner_bench.exe engines\faithful
 .\scripts\check_bench_parity.ps1                               # latency within ±2% of the baselines
+uv run python scripts/measure_fidelity.py --runner runner=bin\matanyone_runner_raw.exe   # alpha vs the original model
 ```
+
+After editing `crates/matanyone-core/kernels/matanyone_kernels.cu`, regenerate the embedded kernels with `.\scripts\build_kernels.ps1`.
 
 | Path | Contents |
 | :--- | :--- |

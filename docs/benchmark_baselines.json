@@ -1,17 +1,17 @@
 {
   "matanyone_trt_bench": {
-    "normal_mean_ms": 21.28,
-    "normal_p99_ms": 24.66,
-    "memory_update_mean_ms": 23.28,
-    "memory_update_p99_ms": 27.03
+    "normal_mean_ms": 17.64,
+    "normal_p99_ms": 18.75,
+    "memory_update_mean_ms": 18.10,
+    "memory_update_p99_ms": 19.73
   },
   "matanyone_runner_bench": {
-    "mixed_mean_ms": 21.05,
-    "mixed_p99_ms": 23.22
+    "mixed_mean_ms": 16.31,
+    "mixed_p99_ms": 17.83
   },
   "matanyone_runner_raw": {
-    "mean_ms": 24.74,
-    "p99_ms": 37.93
+    "mean_ms": 17.17,
+    "p99_ms": 17.92
   },
   "sam_click_mean_ms": null
 }
